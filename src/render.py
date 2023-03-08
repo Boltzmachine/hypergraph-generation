@@ -74,7 +74,7 @@ class BlenderRenderer:
     @stdout_suppress()
     def render_obj(self, path, faces):
         print(path)
-        bpy.ops.import_scene.obj(filepath=path, filter_glob="*.obj")
+        bpy.ops.import_scene.obj(filepath=path, filter_glob="*.obj", split_mode="OFF")
         selected_objects = bpy.context.selected_objects
         assert len(selected_objects) == 1
         obj = selected_objects[0]
@@ -84,7 +84,6 @@ class BlenderRenderer:
         bpy.ops.object.mode_set(mode='EDIT') 
         bpy.ops.mesh.select_mode(type="VERT")
         for face in faces:
-            print(face)
             BlenderRenderer.make_face(obj, face)
         bpy.ops.mesh.select_mode(use_extend=False, use_expand=False, type='FACE')
         bpy.ops.mesh.select_all(action='SELECT')
@@ -98,6 +97,16 @@ class BlenderRenderer:
         bpy.ops.render.render(write_still=True)  # save straight to file
         
         bpy.ops.object.delete()
+        if len(bpy.data.objects) > 4:
+            for obj in bpy.data.objects:
+                if obj.name not in ["Camera", "Key", "Fill", "Rim"]:
+                    obj.select_set(True)
+                    bpy.ops.object.delete()
+
         image = torchvision.io.read_image(outpath)
             
         return image
+    
+    @stdout_suppress()
+    def save_file(self):
+        bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath("results/blender/blender.blend"))

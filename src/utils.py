@@ -79,4 +79,50 @@ def to_sparse_data(X: torch.Tensor, H: torch.Tensor):
     data['verts'].batch = torch.arange(X.size(0)).repeate_interleave(X.size(1))
     data['face'].x = H.view(-1, *H.size()[1:])
     data['face'].batch = torch.arange(H.size(0)).repeate_interleave(H.size(1))
+
+
+def masked_select_X(X, mask):
+    """
+    X - [bs, n_nodes, 3] or [bs, n_nodes, 3, 256]
+    mask - [bs, n_nodes]
+    """
+    mask = mask.bool()
+    if X.dim() == 3:
+        return torch.masked_select(X, mask[..., None]).view(-1, X.size(-1))
+    elif X.dim() == 4:
+        return torch.masked_select(X, mask[..., None, None]).view(-1, X.size(-2), X.size(-1)).transpose(1, -1)
+    else:
+        raise ValueError
     
+    
+def masked_select_H(H, mask):
+    """
+    H - [bs, n_hyper, n_nodes]
+    mask - [bs, n_nodes]
+    
+    return H - [bs * n_nodes, n_hyper]
+    """
+    assert H.dim() == 3
+    mask = mask.bool()
+    return torch.masked_select(H.transpose(1, 2), mask[..., None]).view(-1, H.size(1))
+
+
+def prepare_for_loss_and_metrics(X, batch_X, H, batch_H, mask):
+    """
+    mask out X and H, flatten all of them
+    X: [bs, n_nodes, 3, 256]
+    batch_X: [bs, n_nodes, 3]
+    H: [bs, n_hyper, n_nodes]
+    batch_H: [bs, n_hyper_n_nodes]
+    mask: [bs, n_nodes]
+    """
+    X = masked_select_X(X, mask)
+    batch_X = masked_select_X(batch_X, mask)
+    H = masked_select_H(H, mask)
+    batch_H = masked_select_H(batch_H, mask)
+    assert X.size(-1) == batch_X.size(-1) == 3
+    return X, batch_X, H, batch_H
+
+def create_mask_from_length(length: torch.Tensor):
+    mask = torch.arange(length.max(), device=length.device)[None, :] < length[:, None]
+    return mask.long()

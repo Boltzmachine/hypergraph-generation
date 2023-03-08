@@ -148,9 +148,21 @@ def cache_h5py():
             grp.create_dataset('hyperedge', data=hyperedges)
 
 
+def fix_h5py():
+    with h5py.File(os.path.join(DATA_DIR, "shapenet", "data.h5"), 'r+') as file:
+        for sub in tqdm(file.keys()):
+            for obj in file[sub].keys():
+                # file[sub][obj].move("node", "vertex")
+                # file[sub][obj].move("hyperedge", "face")
+                grp = file[sub][obj]
+                new = np.transpose(grp["face"][()])
+                del grp["face"]
+                grp.create_dataset('face', data=new)
+
+
 if __name__ == "__main__":
     # clean_an_obj_file("/Users/qiuweikang/Downloads/table.obj", "/Users/qiuweikang/Downloads/table1.obj")
     # decimate("/Users/qiuweikang/Downloads/table1.obj", "/Users/qiuweikang/Downloads/table2.obj")
     # process_shapenet()
-    cache_h5py()
-    pass
+    # cache_h5py()
+    fix_h5py()

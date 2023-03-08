@@ -1,14 +1,14 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from tango.common.registrable import Registrable
-from tango.common import Lazy
+from tango.common import Lazy, Registrable, make_registrable, RegistrableFunction
 from tango.integrations.torch import Model
 
 from .dataset import DataContainer
 
 
-def cosine_beta_schedule_discrete(T, s=0.008):
+@make_registrable()
+def cosine_beta_schedule(T, s=0.008):
     """ Cosine schedule as proposed in https://openreview.net/forum?id=-NEXDKk8gZ. """
     t = torch.arange(T+1)
 
@@ -18,6 +18,11 @@ def cosine_beta_schedule_discrete(T, s=0.008):
     assert len(betas) == T
     return betas
 
+@make_registrable()
+def linear_beta_schedule(T, beta_1=1e-4, beta_T=0.02):
+    betas = torch.linspace(beta_1, beta_T, T)
+    return betas
+
 class NoiseScheduler(Model):
     ...
 
@@ -25,14 +30,15 @@ class NoiseScheduler(Model):
 class DiscreteNoiseScheduler(NoiseScheduler):
     def __init__(
             self,
+            beta_schedule: RegistrableFunction,
             n_classes: int = 2,
             T: int = 1000,
             ) -> None:
         super().__init__()
         self.n_classes = n_classes
         self.T = T
-        
-        betas = cosine_beta_schedule_discrete(T)
+
+        betas = beta_schedule(T)
         self.register_buffer("Q", self._get_Q(betas))
         self.register_buffer("Q_bar", self._get_Q_bar(betas)) 
         
@@ -43,21 +49,20 @@ class DiscreteNoiseScheduler(NoiseScheduler):
         return self.Q_bar[t-1]
 
 
-@NoiseScheduler.register("dummy_discrete")
-class DummyDiscreteNoiseScheduler(DiscreteNoiseScheduler):
+@NoiseScheduler.register("identity_discrete")
+class IdentityDiscreteNoiseScheduler(DiscreteNoiseScheduler):
+    name = "identity"
+
     def __init__(
             self,
+            beta_schedule: RegistrableFunction,
             n_classes: int = 2,
             T: int = 1000,
             ) -> None:
-        super().__init__()
+        super().__init__(beta_schedule, n_classes, T)
         self.n_classes = n_classes
         self.T = T
-        
-        betas = cosine_beta_schedule_discrete(T)
-        self.register_buffer("Q", self._get_Q(betas))
-        self.register_buffer("Q_bar", self._get_Q_bar(betas)) 
-        
+
     def _get_Q(self, betas):     
         K = self.n_classes
         return torch.eye(K).repeat(len(betas), 1, 1)
@@ -69,8 +74,15 @@ class DummyDiscreteNoiseScheduler(DiscreteNoiseScheduler):
     
 @NoiseScheduler.register("uniform_discrete")
 class UniformDiscreteNoiseScheduler(DiscreteNoiseScheduler):
-    def __init__(self, n_classes: int = 2, T: int = 1000) -> None:
-        super().__init__(n_classes, T)
+    name = "uniform"
+
+    def __init__(
+            self,
+            beta_schedule: RegistrableFunction,
+            n_classes: int = 2,
+            T: int = 1000
+        ) -> None:
+        super().__init__(beta_schedule, n_classes, T)
     
     def _get_Q(self, betas):     
         """
@@ -93,8 +105,15 @@ class UniformDiscreteNoiseScheduler(DiscreteNoiseScheduler):
 
 @NoiseScheduler.register("gaussian_discrete")
 class GaussianDiscreteNoiseScheduler(DiscreteNoiseScheduler):
-    def __init__(self, n_classes: int = 2, T: int = 1000) -> None:
-        super().__init__(n_classes, T)
+    name = "gaussian"
+    
+    def __init__(
+        self,
+        beta_schedule: RegistrableFunction,
+        n_classes: int = 2, 
+        T: int = 1000
+    ) -> None:
+        super().__init__(beta_schedule, n_classes, T)
     
     def _get_Q(self, betas):     
         K = self.n_classes
