@@ -25,9 +25,9 @@ def test_scheduler_Q_and_Qbar(scheduler_class, beta_schedule):
 
 @pytest.mark.parametrize("K, scheduler_class, beta_schedule", [(3, UniformDiscreteNoiseScheduler, cosine_beta_schedule), (256, GaussianDiscreteNoiseScheduler, linear_beta_schedule)])   
 def test_stationary_uniform(K, scheduler_class, beta_schedule):
-    T = 1000
+    T = 300
     scheduler = scheduler_class(beta_schedule, K, T).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    
+
     Q_inf = scheduler.get_Qt_bar(T)
     assert torch.isclose(Q_inf, torch.ones_like(Q_inf) / K, atol=1e-3).all()
     

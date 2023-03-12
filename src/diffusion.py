@@ -1,6 +1,7 @@
 import os
 import random
 import shutil
+from collections import namedtuple
 import wandb
 
 import torch
@@ -8,18 +9,18 @@ from torch import nn
 import pytorch_lightning as pl
 import torchmetrics
 import torchvision
-from torchvision.utils import make_grid
-
-from collections import namedtuple
+from torchvision.utils import make_grid, save_image
 
 from .dataset import DataContainer, CuboidDataset, quantizer
 from .noise_scheduler import NoiseScheduler, Transition
-from .render import BlenderRenderer
+from .visualize import BlenderRenderer, MatplotlibPlotter, Visualizer
 from .utils import VerticesMutedError, masked_select_H, masked_select_X, prepare_for_loss_and_metrics, create_mask_from_length
 from .distributions import Distribution
 
 from tango.integrations.torch import Model
 from tango.common.registrable import Registrable
+
+from typing import Any
 
 
 class LightningModule(pl.LightningModule, Registrable):
@@ -37,16 +38,18 @@ class Diffusion(pl.LightningModule):
             dist: Distribution,
             edge_criterion: Model = nn.BCEWithLogitsLoss(reduction="none"),
             node_criterion: Model = nn.CrossEntropyLoss(reduction="none"),
+            visualizer: Visualizer = BlenderRenderer(),
             ) -> None:
         super().__init__()
+        # self.save_hyperparameters()
         self.model = model
         self.learning_rate = learning_rate
         self.transition = transition
         self.edge_criterion = edge_criterion
         self.node_criterion = node_criterion
         self.dist = dist
+        self.visualizer = visualizer
         
-        self.renderer = BlenderRenderer()
         self.edge_acc = torchmetrics.Accuracy(task="binary")
         self.node_acc = torchmetrics.Accuracy(task="multiclass", num_classes=transition.node_scheduler.n_classes)
         self.node_mae = torchmetrics.MeanAbsoluteError()
@@ -81,11 +84,13 @@ class Diffusion(pl.LightningModule):
         reweight = (1 - torch.repeat_interleave(t, mask.sum(1)) / self.transition.T) * 2
         assert (reweight >= 0).all()
 
-        node_loss = (node_loss * reweight[:, None]).mean()
-        edge_loss = (edge_loss * reweight[:, None]).mean()
+        # node_loss = (node_loss * reweight[:, None]).mean()
+        # edge_loss = (edge_loss * reweight[:, None]).mean()
+        edge_loss = edge_loss.mean()
+        node_loss = node_loss.mean()
 
-        self.log("train/node_loss", node_loss.mean())
-        self.log("train/edge_loss", edge_loss.mean())
+        self.log("train/node_loss", node_loss)
+        self.log("train/edge_loss", edge_loss)
 
         return node_loss + edge_loss
         
@@ -127,7 +132,20 @@ class Diffusion(pl.LightningModule):
         self.log("val/node_mae", self.node_mae)
         self.log("val/edge_acc", self.edge_acc)
 
-        return
+    def visualize_sequence(self):
+        assert isinstance(self.visualizer, MatplotlibPlotter)
+        gt, pr = self.sample_batch(bs=1, return_every_step=True, fake_sample=True)
+        for t, (X, H) in enumerate(gt):
+            assert X.size(0) == H.size(0) == 1
+            x = quantizer.dequantize(X.squeeze())
+            h = H.squeeze()
+            image = self.visualizer.visualize_object(x, h) / 255.
+            save_image(image, f"results/steps/gt/{t}.png")
+        for t, (X, H) in enumerate(pr):
+            x = quantizer.dequantize(X.squeeze())
+            h = H.squeeze()
+            image = self.visualizer.visualize_object(x, h) / 255.
+            save_image(image, f"results/steps/pr/{t}.png")
         
     def forward(self, X, H, t, mask):
         # X = quantizer.dequantize(X)
@@ -157,35 +175,58 @@ class Diffusion(pl.LightningModule):
         return self.transition.transit(X, H, t)
     
     @torch.no_grad()
-    def sample_batch(self, bs: int = 16, device = torch.device('cuda')):
+    def sample_batch(self, bs: int = 16, device = torch.device('cuda' if torch.cuda.is_available() else "cpu"), return_every_step: bool = False, fake_sample: bool = False):
         if device is None:
             device = self.trainer.device
         n_nodes = self.dist.sample_n(bs, device)
         max_nodes = n_nodes.max()
         
+        # sampling noise
         mask = create_mask_from_length(n_nodes)
-        if self.transition.node_scheduler.name == "identity":
+        
+        if return_every_step:
+            pr = []
+        if fake_sample:
+            # self.transition.T = 50
             X = torch.stack([CuboidDataset.gen_verts() for _ in range(bs)]).to(device)
-        else:
-            X = (torch.randint(0, 256, size=(bs, max_nodes, 3), device=device))
-        if self.transition.edge_scheduler.name == "identity":
             H = CuboidDataset.static_hyperedge[None, ...].expand(bs, -1, -1).to(device)
-        else:
-            H = (torch.rand(bs, self.dist.max_faces, max_nodes, device=device) > 0.5).long()
+            if return_every_step:
+                gt = [(X, H)] + [self.transit(X, H, t * torch.ones(bs, dtype=torch.long, device=device)) for t in range(1, self.transition.T+1)]
+            X, H = gt[-1]
 
+        else:
+            if self.transition.node_scheduler.name == "identity":
+                X = torch.stack([CuboidDataset.gen_verts() for _ in range(bs)]).to(device)
+            else:
+                X = (torch.randint(0, 256, size=(bs, max_nodes, 3), device=device))
+            if self.transition.edge_scheduler.name == "identity":
+                H = CuboidDataset.static_hyperedge[None, ...].expand(bs, -1, -1).to(device)
+            else:
+                H = (torch.rand(bs, self.dist.max_faces, max_nodes, device=device) > 0.5).long()
+            
+        # reverse process
         for t in reversed(range(2, self.transition.T+1)):
+            # if t == 2:
+            #     import pudb; pu.db
             t = torch.ones(bs, dtype=torch.long, device=device) * t
-            X, H = self.denoise(X, H, t, mask)
+            X, H = self.denoise(X, H, t, mask, deterministic=False)
             X, H = self.transit(X, H, t-1)
+            if return_every_step:
+                pr.insert(0, (X, H))
+
         t = torch.ones_like(t)
         X, H = self.denoise(X, H, t, mask, deterministic=True)
-        return X, H
+
+        if return_every_step:
+            pr.insert(0, (X, H))
+                
+        if return_every_step:
+            assert len(gt) == len(pr) + 1
+            return gt, pr
+        else:
+            return X, H
     
     def render_samples(self, X, H):
-        in_mem_dir = "/dev/shm" # store file in memory so it would be faster and still compatible to API
-        temp_dir = "hypergen_render"
-        dir_path = os.path.join(in_mem_dir, temp_dir)
-        dir_path = "./results/wavefront"
         # shutil.rmtree(dir_path)
         # os.makedirs(dir_path, exist_ok=True)
         
@@ -193,22 +234,8 @@ class Diffusion(pl.LightningModule):
         # obj_paths = []
         images = []
         for i, (x, h) in enumerate(zip(list(X), list(H))):
-            obj_path = os.path.join(dir_path, f"{i}.obj")
-            
-            # This face's index is form 0 istead of 1!
-            faces = set()
-            for face in h:
-                face = face.nonzero(as_tuple=True)[0].tolist()
-                faces.add(tuple(face))
-            
-            with open(obj_path, 'w') as file:
-                for vert in x.tolist():
-                    file.write(f"v {vert[0]} {vert[1]} {vert[2]}\n")
-                for face in faces:
-                    file.write(f"#f " + " ".join(map(lambda f: str(f+1), face)) + '\n')
-                    
             try:
-                image = self.renderer.render_obj(obj_path, faces)
+                image = self.visualizer.visualize_object(x, h, i)
             except VerticesMutedError:
                 image = torch.zeros(4, 256, 256, dtype=torch.uint8)
             images.append(image)

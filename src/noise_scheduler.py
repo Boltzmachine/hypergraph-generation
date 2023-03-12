@@ -26,6 +26,32 @@ def linear_beta_schedule(T, beta_1=1e-4, beta_T=0.02):
 class NoiseScheduler(Model):
     ...
 
+
+
+@NoiseScheduler.register("gaussian_continuous")
+class GaussianContinuousNoiseScheduler(NoiseScheduler):
+    def __init__(
+            self, 
+            beta_schedule: RegistrableFunction,
+            T: int = 1000) -> None:
+        super().__init__()
+        self.T = T
+        betas = beta_schedule(T)
+        alpha = 1 - betas
+        alpha_bar = torch.cumprod(alpha, 0)
+        
+        self.register_buffer('beta', betas)
+        self.register_buffer('alpha', alpha)
+        self.register_buffer('alpha_bar', alpha_bar)
+        
+    def get_alphat(self, t):
+        return self.alpha[t-1]
+
+    def get_alphat_bar(self, t):
+        return self.alpha_bar[t-1]
+        
+
+
 @NoiseScheduler.register("discrete")
 class DiscreteNoiseScheduler(NoiseScheduler):
     def __init__(
@@ -39,6 +65,7 @@ class DiscreteNoiseScheduler(NoiseScheduler):
         self.T = T
 
         betas = beta_schedule(T)
+        self.register_buffer("beta", betas)
         self.register_buffer("Q", self._get_Q(betas))
         self.register_buffer("Q_bar", self._get_Q_bar(betas)) 
         
@@ -47,6 +74,9 @@ class DiscreteNoiseScheduler(NoiseScheduler):
     
     def get_Qt_bar(self, t):
         return self.Q_bar[t-1]
+    
+    def get_beta(self, t):
+        return self.beta[t-1]
 
 
 @NoiseScheduler.register("identity_discrete")

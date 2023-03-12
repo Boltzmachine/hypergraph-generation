@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from tango.integrations.torch import Model
 from torch_geometric.nn import HypergraphConv, HeteroConv, GATConv
+import torch_geometric.nn as pyg_nn
 
 from .utils import quantizer
 
@@ -39,30 +40,53 @@ class DummyModel(Model):
 
 @Model.register("cuboid")
 class CuboidModel(Model):
-    def __init__(self, hidden_dim: int = 6):
+    def __init__(self,
+                 hidden_dim: int,
+                 position_encoder: Model,
+            ) -> None:
         super().__init__()
-        self.node_embedder = nn.Linear(3, hidden_dim)
+        self.position_encoder = position_encoder
+        self.node_embedder = nn.Linear(3, 3 * hidden_dim)
         self.edge_embedder = nn.Embedding(2, hidden_dim)
-        self.layers = nn.Sequential(
-            *(
-                [nn.TransformerEncoderLayer(16 * hidden_dim, 4, 128, batch_first=True) for _ in range(2)]
-              + [nn.Linear(16 * hidden_dim, 8)]
-              ),
+        self.node_head = nn.Sequential(
+            nn.Linear(hidden_dim * (24 + 48 + 1), 100 * hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim * 100, 100 * hidden_dim),
+            nn.LeakyReLU(), 
+            nn.Linear(hidden_dim * 100, 100 * hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim * 100, 8 * 3 * 256),
+        )
+        
+        self.edge_head = nn.Sequential(
+            nn.Linear(hidden_dim * (24 + 48 + 1), 100 * hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim * 100, 100 * hidden_dim),
+            nn.LeakyReLU(), 
+            nn.Linear(hidden_dim * 100, 100 * hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim * 100, 6 * 8),
         )
 
-    def forward(self, X, H):
-        X_org = X.clone().detach()
+    def forward(self, X, H, t, mask):
+        """
+        X - [bs, n_nodes, 3]
+        H - [bs, n_nodes, n_hyper]
+        """
+        bs = X.size(0)
         X = quantizer.dequantize(X)
+        # [bs, n_nodes, 3, hidden_dim]
         X = self.node_embedder(X)
         # [bs, n_hyper, n_nodes, hidden_dim]
         H = self.edge_embedder(H)
-        # [bs, n_hyper, n_nodes, hidden_dim]
-        X = X.unsqueeze(1).expand(-1, H.size(1), -1, -1)
-        # [bs, n_hyper, n_nodes, 2*hidden_dim]
-        out = torch.cat([H, X], dim=-1)
-        out = out.view(out.size(0), out.size(1), -1)
-        out = self.layers(out)
-        return X_org, out
+        
+        X = X.view(bs, -1)
+        H = H.view(bs, -1)
+        t = self.position_encoder(t)
+        f = torch.cat([X, H, t], dim=-1)
+        X = self.node_head(f).view(bs, 8, 3, 256)
+        H = self.edge_head(f).view(bs, 6, 8)
+        return X, H
 
 
 class BipartiteDenseGATConv(Model):
@@ -128,6 +152,196 @@ class BipartiteDenseGATConv(Model):
         
         return x_root
     
+    
+class BipartiteDenseGATConv2(Model):
+    def __init__(
+            self,
+            hidden_dim: int,
+            heads: int = 8,
+        ) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.heads = heads
+
+        assert hidden_dim % heads == 0
+        
+        self.lin_src_pos = nn.Linear(hidden_dim, hidden_dim//heads)
+        self.lin_src_neg = nn.Linear(hidden_dim, hidden_dim//heads)
+        self.lin_src_att = nn.Linear(hidden_dim, hidden_dim//heads)
+        
+        self.lin_tgt_att = nn.Linear(hidden_dim, hidden_dim//heads)
+        
+        self.attn = nn.Linear(2 * hidden_dim // heads, heads, bias=False)
+
+        self.lin_root = nn.Linear(hidden_dim, hidden_dim)
+        self.lin_msg = nn.Linear(hidden_dim, hidden_dim)
+
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(2 * hidden_dim, hidden_dim)
+        )
+        
+    
+    def forward(self, x_src, x_tgt, edge_attr, mask=None):
+        """
+        x_tgt: [bs, n_tgt_nodes, n_features]
+        x_src: [bs, n_src_nodes, n_features]
+        edge_attr: [bs, n_src_nodes, n_tgt_nodes]
+        """
+        x_root = x_tgt
+        edge_attr = edge_attr.transpose(1, -1)
+        
+        # [bs, n_src_nodes, hidden_dim//head]
+        x_src_pos = self.lin_src_pos(x_src)
+        x_src_neg = self.lin_src_neg(x_src)
+        
+        x_tgt_att = self.lin_tgt_att(x_tgt)
+        x_src_att = self.lin_src_att(x_src)
+        
+        # attention coefficients [bs, n_tgt_nodes, n_src_nodes, heads]
+        alpha = self.attn(torch.cat([x_src_att.unsqueeze(1).expand(-1, x_tgt_att.size(1), -1, -1), x_tgt_att.unsqueeze(2).expand(-1, -1, x_src_att.size(1), -1)], dim=-1))
+        # attention coefficients [bs, heads, n_tgt_nodes, n_src_nodes]
+        alpha = alpha.permute(0, 3, 1, 2)
+        alpha = F.leaky_relu(alpha)
+        if mask is not None:
+            mask = ((mask - 1) * 1e10)[:, None, None, :]
+            alpha = alpha + mask
+            
+        alpha = torch.softmax(alpha, dim=-1)
+        
+        # [bs, n_tgt_nodes, n_src_nodes, hidden_dim//head]
+        x_src_msg = (edge_attr == 1).unsqueeze(-1) * x_src_pos[:, None, :, :] + (edge_attr == 0).unsqueeze(-1) * x_src_neg[:, None, :, :]
+        
+        # [bs, heads, n_tgt_nodes, n_features] = [bs, heads, n_tgt_nodes, n_src_nodes, 1] * [bs, 1, n_tgt_nodes, n_src_nodes, n_features]
+        src_msg = (alpha.unsqueeze(-1) * x_src_msg[:, None, ...]).sum(-2)
+        # [bs, n_tgt_nodes, heads, n_features] 
+        src_msg = src_msg.transpose(1, 2)
+        src_msg = src_msg.reshape(src_msg.size(0), src_msg.size(1), -1)
+        x_root = self.lin_root(x_root) + src_msg
+        x_root = self.feed_forward(x_root)
+        
+        return x_root
+    
+
+class BipartiteDenseGATConv3(Model):
+    def __init__(
+            self,
+            hidden_dim: int,
+            heads: int,
+        ) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.heads = heads
+
+        assert hidden_dim % heads == 0
+        
+        self.lin_src_msg = nn.Linear(hidden_dim, hidden_dim//heads)
+
+        self.lin_src_att = nn.Linear(hidden_dim, hidden_dim//heads)        
+        self.lin_tgt_att = nn.Linear(hidden_dim, hidden_dim//heads)
+
+        self.lin_root = nn.Linear(hidden_dim, hidden_dim)
+        self.lin_agg = nn.Linear(hidden_dim, hidden_dim)
+
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(2 * hidden_dim, hidden_dim)
+        )
+
+        
+    def forward(self, x_tgt, x_src, adj, mask=None):
+        """
+        adj - [bs, n_tgt, n_src]
+        """
+        
+        x_root = x_tgt
+        # [bs, n_tgt_nodes, hidden_dim//head]
+        x_tgt_att = self.lin_tgt_att(x_tgt)
+        # [bs, n_src_nodes, hidden_dim//head]
+        x_src_att = self.lin_src_att(x_src)
+        
+        x_src_msg = self.lin_src_msg(x_src)
+        
+        # attention coefficients [bs, n_tgt_nodes, n_src_nodes, heads]
+        alpha = self.attn(torch.cat([x_src_att.unsqueeze(1).expand(-1, x_tgt_att.size(1), -1, -1), x_tgt_att.unsqueeze(2).expand(-1, -1, x_src_att.size(1), -1)], dim=-1))
+        # attention coefficients [bs, heads, n_tgt_nodes, n_src_nodes]
+        alpha = alpha.permute(0, 3, 1, 2)
+        alpha = F.leaky_relu(alpha)
+        if mask is not None:
+            mask = ((mask - 1) * 1e10)[:, None, None, :]
+            alpha = alpha + mask
+            
+        alpha = torch.softmax(alpha, dim=-1)
+
+        # [bs, heads, n_tgt_nodes, n_features] = [bs, heads, n_tgt_nodes, n_src_nodes, 1] * [bs, 1, n_tgt_nodes, n_src_nodes, n_features]
+        src_msg = (alpha.unsqueeze(-1) * x_src_msg[:, None, ...]).sum(-2)
+        # [bs, n_tgt_nodes, heads, n_features] 
+        src_msg = src_msg.transpose(1, 2)
+        src_msg = src_msg.reshape(src_msg.size(0), src_msg.size(1), -1)
+        x_root = self.lin_root(x_root) + self.lin_agg(src_msg)
+        x_root = self.feed_forward(x_root)
+        
+        return x_root
+    
+
+class MultiChannelGNNConv(Model):
+    def __init__(
+        self,
+        hidden_dim: int,
+        n_channels: int = 2,
+        ) -> None:
+        super().__init__()
+        self.n_channels = n_channels
+        self.hidden_dim = hidden_dim
+        aggr = ['mean', 'sum', 'std', 'max', 'min']
+        self.conv1 = pyg_nn.SAGEConv(hidden_dim, hidden_dim, aggr=aggr)
+        self.conv2 = pyg_nn.SAGEConv(hidden_dim, hidden_dim, aggr=aggr)
+        # self.conv1 = pyg_nn.GENConv(hidden_dim, hidden_dim)
+        # self.conv2 = pyg_nn.GENConv(hidden_dim, hidden_dim)
+        # self.conv1 = pyg_nn.GATConv(hidden_dim, hidden_dim)
+        # self.conv2 = pyg_nn.GATConv(hidden_dim, hidden_dim)
+        
+        self.downscale = nn.Sequential(
+            nn.Linear(2 * hidden_dim, 2 * hidden_dim),
+            nn.LeakyReLU(), 
+            nn.Dropout(0.2),
+            nn.Linear(2 * hidden_dim, hidden_dim)
+        )
+
+        
+    def forward(self, x_src, x_tgt, adj, mask=None):
+        """
+        x_tgt - [bs, n_tgt_nodes, hidden_dim]
+        x_src - [bs, n_src_nodes, hidden_dim]
+        """
+        bs, n_tgt_nodes, hidden_dim = x_tgt.size()
+        _, n_src_nodes, hidden_dim = x_src.size()
+        
+        x_tgt = x_tgt.reshape(-1, hidden_dim)
+        x_src = x_src.reshape(-1, hidden_dim)
+        
+        def adj_to_edge_index(adj):
+            edge_index = adj.nonzero()            
+            edge_index = edge_index[:, 0].unsqueeze(1) * torch.tensor([n_src_nodes, n_tgt_nodes], device=edge_index.device, dtype=edge_index.dtype) + edge_index[:, 1:]
+            edge_index = edge_index.T
+            edge_index = torch.sort(edge_index, 1)[0]
+            return edge_index
+        
+        edge_index1 = adj_to_edge_index(adj)
+        edge_index2 = adj_to_edge_index(1-adj)
+
+        x_tgt_1 = self.conv1((x_src, x_tgt), edge_index1)
+        x_tgt_2 = self.conv2((x_src, x_tgt), edge_index2)
+            
+        x_tgt = self.downscale(torch.cat([x_tgt_1, x_tgt_2], dim=-1))
+        
+        x_tgt = x_tgt.view(bs, n_tgt_nodes, hidden_dim)
+
+        return x_tgt
                 
 @Model.register("hyper")
 class HyperModel(Model):
@@ -135,21 +349,50 @@ class HyperModel(Model):
             self,
             hidden_dim: int,
             position_encoder: Model,
+            backbone: str,
         ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.position_encoder = position_encoder
 
-        self.node_embedder = nn.Linear(3, hidden_dim)
-        self.edge_embedder = nn.Embedding(2, hidden_dim)
+        self.node_embedder = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.face_embedder = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
         
+        node_types = ["vertex", "face"]
+        edge_types = [("vertex", "in", "face"), ("face", "has", "vertex")]
+        meta_data = (node_types, edge_types)
+        
+        backbone_class = {
+            "pyg": MultiChannelGNNConv,
+            "dense": BipartiteDenseGATConv2
+        }[backbone]
         self.convs = nn.ModuleList([
-            nn.ModuleList([BipartiteDenseGATConv(hidden_dim),BipartiteDenseGATConv(hidden_dim)])
+            nn.ModuleList([backbone_class(hidden_dim), backbone_class(hidden_dim)])
             for _ in range(2)
         ])
 
-        self.node_head = nn.Linear(hidden_dim, 256 * 3)
-        self.edge_head = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.node_head = nn.Sequential(
+            nn.Linear(1 * hidden_dim, 2 * hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(2 * hidden_dim, 256 * 3)
+        )
+        self.edge_head = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
 
     def forward(self, X, H, t, mask):
         """
@@ -160,25 +403,36 @@ class HyperModel(Model):
         # H_ = H.float() * 2e10 - 1e10
         bs, n_nodes, _ = X.size()
         _, n_hyper, _ = H.size()
-        H = self.edge_embedder(H)
-
-        X = quantizer.dequantize(X).to(H.dtype)
+        # [bs, n_nodes, 3]
+        X = quantizer.dequantize(X)
+        # [bs, n_nodes, hidden_dim]
         X = self.node_embedder(X)
 
         pos_emb = self.position_encoder(t)
         # [bs, n_nodes, hidden_dim]
         vertex_emb = (X + pos_emb[:, None, :])# * mask[..., None]
-        face_emb = pos_emb[:, None, :].expand(-1, n_hyper, -1)
-        edge_emb = H# * mask[:, None, :, None]
-        
-        # [bs, n_hyper, hidden_dim]
-        for conv in self.convs:
-            face_emb = conv[0](face_emb, vertex_emb, edge_emb, mask) + face_emb
-            vertex_emb = conv[1](vertex_emb, face_emb, edge_emb.transpose(1, 2)) + vertex_emb
 
+        face_emb = self.face_embedder(H.sum(-1, keepdim=True).float())
+        face_emb = face_emb + pos_emb[:, None, :]
+        
+        for conv in self.convs:
+            # [bs, n_hyper, hidden_dim]
+            face_emb = conv[0](vertex_emb, face_emb, H.transpose(1, 2), mask) + face_emb
+            # [bs, n_node, hidden_dim]
+            vertex_emb = conv[1](face_emb, vertex_emb, H) + vertex_emb
+            
+        # [bs, n_hyper, n_nodes, 2 * hidden_dim]
+        edge_emb = torch.cat([
+            face_emb[:, :, None, :].expand(-1, -1, n_nodes, -1),
+            vertex_emb[:, None, :, :].expand(-1, n_hyper, -1, -1)
+            ], dim=-1)
+
+        # vertex_emb = torch.cat([vertex_emb, X], dim=-1)
         # [bs, n_nodes, 3 * hidden_dim]
         X = self.node_head(vertex_emb).view(bs, n_nodes, 3, -1)
-        H = face_emb @ self.edge_head.weight @ vertex_emb.transpose(-1, -2)
+        # [bs, n_hyper, n_nodes]
+        # edge_emb = torch.cat([edge_emb, H[..., None].expand(-1, -1, -1, self.hidden_dim).to(edge_emb.dtype)], dim=-1)
+        H = self.edge_head(edge_emb).squeeze(-1)
     
         return X, H
     
@@ -201,13 +455,13 @@ class SeparateModel(Model):
         self.node_head = nn.Sequential(
             nn.TransformerEncoderLayer(hidden_dim, heads, 2 * hidden_dim, batch_first=True, dropout=0),
             nn.TransformerEncoderLayer(hidden_dim, heads, 2 * hidden_dim, batch_first=True, dropout=0),
-            nn.TransformerEncoderLayer(hidden_dim, heads, 2 * hidden_dim, batch_first=True, dropout=0),
+            # nn.TransformerEncoderLayer(hidden_dim, heads, 2 * hidden_dim, batch_first=True, dropout=0),
             nn.Linear(hidden_dim, 256 * 3)
         )
         self.edge_head = nn.Sequential(
             nn.TransformerEncoderLayer(hidden_dim, heads, 2 * hidden_dim, batch_first=True, dropout=0),
             nn.TransformerEncoderLayer(hidden_dim, heads, 2 * hidden_dim, batch_first=True, dropout=0),
-            nn.TransformerEncoderLayer(hidden_dim, heads, 2 * hidden_dim, batch_first=True, dropout=0),
+            # nn.TransformerEncoderLayer(hidden_dim, heads, 2 * hidden_dim, batch_first=True, dropout=0),
             nn.Linear(hidden_dim, 1)
         )
     

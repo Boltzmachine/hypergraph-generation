@@ -1,4 +1,4 @@
-local hidden_dim = 256;
+local hidden_dim = 8;
 local T = 500;
 local batch_size = 512;
 
@@ -7,22 +7,21 @@ local batch_size = 512;
     train: {
       type: "train",
       trainer: {
-        max_epochs: 300,
+        max_epochs: 200,
         accelerator: "auto",
       },
       model: {
         type: 'diffusion',
         model: {
-          type: "hyper",
+          type: "cuboid",
           hidden_dim: hidden_dim,
           position_encoder: {
             type: "position",
-            d_model: hidden_dim,
+            d_model: 10 * hidden_dim,
             max_len: T
-          },
-          backbone: "pyg"
+          }
         },
-        learning_rate: 1e-3,
+        learning_rate: 1e-4,
         transition: {
           T: T,
           node_scheduler: {

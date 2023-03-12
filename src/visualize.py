@@ -1,12 +1,24 @@
 import torch
 import torchvision
+from torchvision.transforms.functional import resize
 import bpy
 import os
 import sys
 from os import dup, close
 from contextlib import ContextDecorator
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+from tango.common import Registrable
 
 from .utils import VerticesMutedError
+
+
+class Visualizer(Registrable):
+    ...
 
 
 class stdout_suppress(ContextDecorator):
@@ -27,9 +39,11 @@ class stdout_suppress(ContextDecorator):
         os.dup(self.old)
         os.close(self.old)
             
-        
-class BlenderRenderer:
+
+@Visualizer.register("blender") 
+class BlenderRenderer(Visualizer):
     def __init__(self, engine = 'BLENDER_EEVEE'):
+        bpy.ops.wm.read_homefile()
         self.resolution_x = 256
         self.resolution_y = 256
         bpy.ops.object.delete(use_global=False)
@@ -72,9 +86,27 @@ class BlenderRenderer:
         bpy.ops.mesh.edge_face_add()
 
     @stdout_suppress()
-    def render_obj(self, path, faces):
-        print(path)
-        bpy.ops.import_scene.obj(filepath=path, filter_glob="*.obj", split_mode="OFF")
+    def visualize_object(self, x, h, idx=None):
+        in_mem_dir = "/dev/shm" # store file in memory so it would be faster and still compatible to API
+        temp_dir = "hypergen_render"
+        dir_path = os.path.join(in_mem_dir, temp_dir)
+        dir_path = "./results/wavefront"
+        obj_path = os.path.join(dir_path, f"{idx}.obj")
+        # This face's index is form 0 istead of 1!
+        
+        h = torch.unique(h, dim=0, sorted=False)
+        faces = []
+        for face in h:
+            face = face.nonzero(as_tuple=True)[0].tolist()
+            faces.append(face)
+        
+        with open(obj_path, 'w') as file:
+            for vert in x.tolist():
+                file.write(f"v {vert[0]} {vert[1]} {vert[2]}\n")
+            for face in faces:
+                file.write(f"#f " + " ".join(map(lambda f: str(f+1), face)) + '\n')
+
+        bpy.ops.import_scene.obj(filepath=obj_path, filter_glob="*.obj", split_mode="OFF")
         selected_objects = bpy.context.selected_objects
         assert len(selected_objects) == 1
         obj = selected_objects[0]
@@ -90,11 +122,12 @@ class BlenderRenderer:
         bpy.ops.mesh.normals_make_consistent(inside=False)
         bpy.ops.object.mode_set(mode='OBJECT') 
     
-        ind = os.path.split(path)[-1].split('.')[0]
+        ind = os.path.split(obj_path)[-1].split('.')[0]
         
         outpath = f"results/render/{ind}.png"
         bpy.context.scene.render.filepath = outpath
         bpy.ops.render.render(write_still=True)  # save straight to file
+        # self.save_file(f"results/blender/{ind}.blend")
         
         bpy.ops.object.delete()
         if len(bpy.data.objects) > 4:
@@ -108,5 +141,61 @@ class BlenderRenderer:
         return image
     
     @stdout_suppress()
-    def save_file(self):
-        bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath("results/blender/blender.blend"))
+    def save_file(self, path="results/blender/blender.blend"):
+        bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(path))
+        
+
+@Visualizer.register("matplotlib")
+class MatplotlibPlotter(Visualizer):
+    def __init__(self) -> None:
+        super().__init__()
+        
+    def visualize_object(self, x, h, idx=None):
+        """
+        x - [n_nodes, 3]
+        h - [n_hyper, n_nodes]
+        """
+        device = x.device
+        x = x.cpu().numpy()
+        h = torch.unique(h, dim=0, sorted=False).bool().cpu().numpy()
+        collection = []
+        for face in h:
+            collection.append(x[face])
+        
+        fig = plt.figure(figsize=(3, 3), dpi=96)
+        canvas = FigureCanvas(fig)
+        ax = fig.add_subplot(111, projection='3d')
+        
+        plt_mesh = Poly3DCollection(collection)
+        plt_mesh.set_edgecolor((0., 0., 0., 0.0))
+        plt_mesh.set_facecolor((1, 0, 0, 0.0))
+        ax.add_collection3d(plt_mesh)
+
+        ax.scatter3D(
+            x[:, 0],
+            x[:, 1],
+            x[:, 2],
+            lw=0.,
+            s=10,
+            c=['b', 'g', 'r', 'c', 'm', 'y', 'k', 'darkorange'],
+            alpha=0.75)
+        
+        ax_lims = 0.5
+        ax.set_xlim(-ax_lims, ax_lims)
+        ax.set_ylim(-ax_lims, ax_lims)
+        ax.set_zlim(-ax_lims, ax_lims)
+
+        ax.view_init(30, 120)
+        
+        canvas.draw()
+        width, height = fig.get_size_inches() * fig.get_dpi()
+        width = width.astype(int)
+        height = height.astype(int)
+        image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8').reshape(height, width, 3) 
+        image = torch.from_numpy(image)
+        image = image.to(device).permute(2, 0, 1)
+        image = resize(image, (256, 256))
+        
+        plt.close()
+        
+        return image
