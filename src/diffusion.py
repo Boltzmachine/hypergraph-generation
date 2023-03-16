@@ -3,24 +3,27 @@ import random
 import shutil
 from collections import namedtuple
 import wandb
+from tqdm import tqdm
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics
 import torchvision
 from torchvision.utils import make_grid, save_image
 
-from .dataset import DataContainer, CuboidDataset, quantizer
-from .noise_scheduler import NoiseScheduler, Transition
+from .dataset import DataContainer, CuboidDataset, quantizer, mask_collate_fn
+from .transition import Transition
 from .visualize import BlenderRenderer, MatplotlibPlotter, Visualizer
-from .utils import VerticesMutedError, masked_select_H, masked_select_X, prepare_for_loss_and_metrics, create_mask_from_length
+from .utils import VerticesMutedError, masked_select_H, masked_select_X, prepare_for_loss_and_metrics, create_mask_from_length, make_gif
 from .distributions import Distribution
+from .model import HyperInitialModel
 
 from tango.integrations.torch import Model
 from tango.common.registrable import Registrable
 
-from typing import Any
+from typing import Any, Union, List
 
 
 class LightningModule(pl.LightningModule, Registrable):
@@ -37,8 +40,8 @@ class Diffusion(pl.LightningModule):
             transition: Transition,
             dist: Distribution,
             edge_criterion: Model = nn.BCEWithLogitsLoss(reduction="none"),
-            node_criterion: Model = nn.CrossEntropyLoss(reduction="none"),
-            visualizer: Visualizer = BlenderRenderer(),
+            node_criterion: Model = nn.L1Loss(reduction="none"),
+            visualizer: Union[Visualizer, List[Visualizer]] = BlenderRenderer(),
             ) -> None:
         super().__init__()
         # self.save_hyperparameters()
@@ -51,7 +54,7 @@ class Diffusion(pl.LightningModule):
         self.visualizer = visualizer
         
         self.edge_acc = torchmetrics.Accuracy(task="binary")
-        self.node_acc = torchmetrics.Accuracy(task="multiclass", num_classes=transition.node_scheduler.n_classes)
+        # self.node_acc = torchmetrics.Accuracy(task="multiclass", num_classes=transition.node_scheduler.n_classes)
         self.node_mae = torchmetrics.MeanAbsoluteError()
 
     def configure_optimizers(self):
@@ -67,17 +70,33 @@ class Diffusion(pl.LightningModule):
             },
         }
         
-    def training_step(self, batch, batch_idx):
+    def shared_step(self, batch, batch_idx):
+        """
+        step shared by training and validation
+        """
         X = batch['X']
         H = batch['H']
         mask = batch['mask']
-        
+                
         t = torch.randint(1, self.transition.T+1, size=(X.size(0),), device=X.device)
-
-        X, H = self.transit(X, H, t)
-        X, H = self.forward(X, H, t, mask)
         
-        pred_X, true_X, pred_H, true_H = prepare_for_loss_and_metrics(X, batch['X'], H, batch['H'], mask)
+        XT, _ = self.transit(X, H, torch.ones_like(t) * self.transition.T)[0]
+        forward_kwargs = self.construct_forward_kwargs(XT=XT)
+        
+        (X, X_noise), (H, H_noise) = self.transit(X, H, t)
+        pred_X, H = self.forward(X, H, t, mask, **forward_kwargs)
+        
+        pred_X, true_X, pred_H, true_H = prepare_for_loss_and_metrics(pred_X, X_noise, H, batch['H'], mask)
+        
+        if self.transition.node_scheduler.name == "identity":
+            pred_X = true_X
+        if self.transition.edge_scheduler.name == "identity":
+            pred_H = F.one_hot(true_H) * 2e10 - 1e10
+        
+        return pred_X, true_X, pred_H, true_H, t, mask
+        
+    def training_step(self, batch, batch_idx):
+        pred_X, true_X, pred_H, true_H, t, mask = self.shared_step(batch, batch_idx)
         edge_loss = self.edge_criterion(pred_H, true_H.float())
         node_loss = self.node_criterion(pred_X, true_X)
 
@@ -87,38 +106,24 @@ class Diffusion(pl.LightningModule):
         # node_loss = (node_loss * reweight[:, None]).mean()
         # edge_loss = (edge_loss * reweight[:, None]).mean()
         edge_loss = edge_loss.mean()
-        node_loss = node_loss.mean()
+        node_loss = node_loss.mean() * 3
 
         self.log("train/node_loss", node_loss)
         self.log("train/edge_loss", edge_loss)
 
         return node_loss + edge_loss
-        
-    # def on_train_epoch_end(self):
-    #     self.log("train/node_acc", self.node_acc)
-    #     self.log("train/node_mae", self.node_mae)
-    #     self.log("train/edge_acc", self.edge_acc)
-        
     
     def validation_step(self, batch, batch_idx):
-        X = batch['X']
-        H = batch['H']
-        mask = batch['mask']
-        
-        t = torch.randint(1, self.transition.T+1, size=(X.size(0),))
-        X, H = self.transit(X, H, t)
-        X, H = self.forward(X, H, t, mask)
-        
-        pred_X, true_X, pred_H, true_H = prepare_for_loss_and_metrics(X, batch['X'], H, batch['H'], mask)
+        pred_X, true_X, pred_H, true_H, t, mask = self.shared_step(batch, batch_idx)
+
         self.edge_acc(pred_H, true_H)
-        self.node_acc(pred_X, true_X)
-        self.node_mae(quantizer.dequantize(pred_X.transpose(1, -1).argmax(-1)), quantizer.dequantize(true_X))
+        self.node_mae(pred_X, true_X)
 
         return 
 
     def on_validation_epoch_start(self):
-        X, H = self.sample_batch()
-        images = self.render_samples(quantizer.dequantize(X), H)
+        X, H = self.sample_batch(fake_sample=False)
+        images = self.render_samples(quantizer.quantize2(X), H)
         grid = make_grid(images, nrow=4)
         grid = grid.float()
         wandb.log({
@@ -128,94 +133,94 @@ class Diffusion(pl.LightningModule):
         # self.renderer.save_file()
 
     def on_validation_epoch_end(self) -> None:
-        self.log("val/node_acc", self.node_acc)
+        # self.log("val/node_acc", self.node_acc)
         self.log("val/node_mae", self.node_mae)
         self.log("val/edge_acc", self.edge_acc)
 
     def visualize_sequence(self):
         assert isinstance(self.visualizer, MatplotlibPlotter)
-        gt, pr = self.sample_batch(bs=1, return_every_step=True, fake_sample=True)
-        for t, (X, H) in enumerate(gt):
-            assert X.size(0) == H.size(0) == 1
-            x = quantizer.dequantize(X.squeeze())
-            h = H.squeeze()
-            image = self.visualizer.visualize_object(x, h) / 255.
-            save_image(image, f"results/steps/gt/{t}.png")
-        for t, (X, H) in enumerate(pr):
-            x = quantizer.dequantize(X.squeeze())
-            h = H.squeeze()
-            image = self.visualizer.visualize_object(x, h) / 255.
-            save_image(image, f"results/steps/pr/{t}.png")
+        gt, pr = self.sample_batch(bs=8, return_every_step=True, fake_sample=True)
+                
+        def to_gif(tensors, path):
+            images = [[] for _ in range(tensors[0][0].size(0))]
+            for t, (X, H) in enumerate(tqdm(tensors)):
+                X = quantizer.quantize2(X.squeeze())
+                H = H.squeeze()
+                for i, (x, h) in enumerate(zip(X, H)):
+                    image = self.visualizer.visualize_object(x, h) / 255.
+                    images[i].insert(0, image)
+            for i, image in enumerate(images):
+                make_gif(image, path + str(i))
+            # save_image(image, f"results/steps/gt/{t}.png")
+        # to_gif(gt, "results/steps/gt")
+        to_gif(pr, "results/steps/pr")
+            # save_image(image, f"results/steps/pr/{t}.png")
         
-    def forward(self, X, H, t, mask):
+    def forward(self, X, H, t, mask, **kwargs):
         # X = quantizer.dequantize(X)
-        X, H = self.model(X, H, t, mask)
+        X, H = self.model(X, H, t, mask, **kwargs)
   
         return X, H
     
     def denoise(self, *args, deterministic=False, **kwargs):
-        X, H = self.forward(*args, **kwargs)
+        X0, H0 = self.forward(*args, **kwargs)
+        Xt, Ht, t, _ = args
+        assert Xt.size() == X0.size()
         
-        X_prob = torch.softmax(X, -1)
-        H = torch.sigmoid(H)
-        H_prob = torch.stack([1-H, H], dim=-1)
-        
-        if deterministic:
-            H = H_prob.argmax(-1)
-            X = X_prob.argmax(-1)
-        else:
-            H_prob = H_prob.view(-1, H_prob.size(-1))
-            H = H_prob.multinomial(1).view(*H.size())
-            X_prob = X_prob.view(-1, X_prob.size(-1))
-            X = X_prob.multinomial(1).view(*X.size()[:-1])
-        
-        return X, H
+        return self.transition.denoise((X0, Xt), (H0, Ht), t, deterministic)
     
     def transit(self, X, H, t):
         return self.transition.transit(X, H, t)
     
     @torch.no_grad()
     def sample_batch(self, bs: int = 16, device = torch.device('cuda' if torch.cuda.is_available() else "cpu"), return_every_step: bool = False, fake_sample: bool = False):
-        if device is None:
-            device = self.trainer.device
         n_nodes = self.dist.sample_n(bs, device)
         max_nodes = n_nodes.max()
-        
-        # sampling noise
-        mask = create_mask_from_length(n_nodes)
-        
+
+        sample_start = self.transition.T
         if return_every_step:
             pr = []
         if fake_sample:
-            # self.transition.T = 50
-            X = torch.stack([CuboidDataset.gen_verts() for _ in range(bs)]).to(device)
-            H = CuboidDataset.static_hyperedge[None, ...].expand(bs, -1, -1).to(device)
+            # sample_start = 50
+            datalist = mask_collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
+            X = datalist['X'].to(device)
+            mask = datalist['mask'].to(device)
+            H = datalist['H'].to(device)
+
             if return_every_step:
-                gt = [(X, H)] + [self.transit(X, H, t * torch.ones(bs, dtype=torch.long, device=device)) for t in range(1, self.transition.T+1)]
-            X, H = gt[-1]
+                gt = [(X, H)]
+                for t in range(1, sample_start+1):
+                    (Xt, _), Ht = self.transit(X, H, t * torch.ones(bs, dtype=torch.long, device=device))
+                    gt.append((Xt, Ht))
+                X, H = gt[-1]
+            else:
+                (X, _), H = self.transit(X, H, sample_start * torch.ones(bs, dtype=torch.long, device=device))
 
         else:
+            if self.transition.node_scheduler.name == "identity" or self.transition.edge_scheduler.name == "identity":
+                datalist = mask_collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
             if self.transition.node_scheduler.name == "identity":
-                X = torch.stack([CuboidDataset.gen_verts() for _ in range(bs)]).to(device)
+                X = datalist['X'].to(device)
+                mask = datalist['mask'].to(device)
             else:
-                X = (torch.randint(0, 256, size=(bs, max_nodes, 3), device=device))
+                mask = create_mask_from_length(n_nodes)
+                X = torch.randn(size=(bs, max_nodes, 3), device=device)
             if self.transition.edge_scheduler.name == "identity":
-                H = CuboidDataset.static_hyperedge[None, ...].expand(bs, -1, -1).to(device)
+                H = datalist['H'].to(device)
             else:
                 H = (torch.rand(bs, self.dist.max_faces, max_nodes, device=device) > 0.5).long()
-            
+        
+        forward_kwargs = self.construct_forward_kwargs(XT=X)
         # reverse process
-        for t in reversed(range(2, self.transition.T+1)):
-            # if t == 2:
-            #     import pudb; pu.db
+        for t in reversed(range(2, sample_start+1)):
             t = torch.ones(bs, dtype=torch.long, device=device) * t
-            X, H = self.denoise(X, H, t, mask, deterministic=False)
-            X, H = self.transit(X, H, t-1)
+            X, H = self.denoise(X, H, t, mask, deterministic=False, **forward_kwargs)
+
             if return_every_step:
                 pr.insert(0, (X, H))
 
         t = torch.ones_like(t)
-        X, H = self.denoise(X, H, t, mask, deterministic=True)
+        X, H = self.denoise(X, H, t, mask, deterministic=True, **forward_kwargs)
 
         if return_every_step:
             pr.insert(0, (X, H))
@@ -242,3 +247,9 @@ class Diffusion(pl.LightningModule):
             
         images = torch.stack(images)
         return images
+    
+    def construct_forward_kwargs(self, **kwargs):
+        forward_kwargs = {}
+        if isinstance(self.model, HyperInitialModel):
+            forward_kwargs["XT"] = kwargs["XT"]
+        return forward_kwargs

@@ -18,6 +18,20 @@ from typing import Any
 import logging
 logger = logging.getLogger("pytorch_lightning")
 
+
+class BipartiteData(Data):
+    def __init__(self, edge_index1=None, edge_index2=None, x_s=None, x_t=None):
+        super().__init__()
+        self.edge_index1 = edge_index1
+        self.edge_index2 = edge_index2
+        self.x_s = x_s
+        self.x_t = x_t
+    def __inc__(self, key, value, *args, **kwargs):
+        if key == "edge_index1" or key == "edge_index2":
+            return torch.tensor([[self.x_s.size(0)], [self.x_t.size(0)]])
+        else:
+            return super().__inc__(key, value, *args, **kwargs)
+
 @dataclasses.dataclass
 class DataContainer():
     X: torch.Tensor
@@ -60,13 +74,13 @@ class ShapenetDataset(Dataset):
 
     def __getitem__(self, idx):
         subset, obj = self.keys[idx]
-        data = self.file[obj]
-        verts = torch.from_numpy(data['vertex'][()])
-        faces = torch.from_numpy(data['face'][()])
+        data = self.file[subset][obj]
+        verts = torch.from_numpy(data['vertex'][()]).float()
+        faces = torch.from_numpy(data['face'][()]).long()
         faces = torch.cat([faces, torch.zeros(self.max_n_face - faces.size(0), faces.size(1), dtype=faces.dtype)], dim=0)
 
         return {
-            "X": quantizer.quantize(verts),
+            "X": verts,
             "H": faces
         }
 
@@ -107,7 +121,7 @@ class CuboidDataset(Dataset):
         edges = edges / diag
         verts = torch.stack([edges/2, -edges/2], dim=1) # 3x2
         verts = torch.cartesian_prod(verts[0], verts[1], verts[2])
-        return quantizer.quantize(verts)
+        return verts
 
 
 def mask_collate_fn(batchs):
@@ -119,7 +133,6 @@ def mask_collate_fn(batchs):
         mask[:X.size(0)] = 1
         batch['mask'] = mask
         batch['X'] = torch.cat([X, torch.zeros(pad_len, X.size(1), dtype=X.dtype)], dim=0)
-        batch['X'].masked_fill(~mask.bool(), -100)
         H = batch['H']
         batch['H'] = torch.cat([H, torch.zeros(H.size(0), pad_len, dtype=H.dtype)], dim=1)
 
@@ -176,18 +189,19 @@ class ShapenetDataModule(DataModule):
         self.subset = subset
         self.batch_size = batch_size
         self.num_workers = num_workers
-    
-    def setup(self, stage: str):
+        
+    def prepare_data(self) -> None:
         self.file = h5py.File(os.path.join(self.data_path, "data.h5"), 'r')
         file = self.file
         if (subset := self.subset) is not None:
-            file = file[subset]
-            keys = [(subset, k) for k in file.keys()]
+            keys = [(subset, k) for k in file[subset].keys()]
         else:
             raise NotImplementedError
         self.keys = keys
-        
-        dataset = ShapenetDataset(file, keys, max(self.meta_info['n_faces']))
+        self.subset = subset
+    
+    def setup(self, stage: str):
+        dataset = ShapenetDataset(self.file, self.keys, max(self.meta_info['n_faces']))
         val_len = int(0.1 * len(dataset))
 
         # from tqdm import tqdm

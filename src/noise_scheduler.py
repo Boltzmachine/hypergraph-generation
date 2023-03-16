@@ -12,24 +12,55 @@ def cosine_beta_schedule(T, s=0.008):
     """ Cosine schedule as proposed in https://openreview.net/forum?id=-NEXDKk8gZ. """
     t = torch.arange(T+1)
 
-    f = torch.cos(0.5 * torch.pi * ((t / T) + s) / (1 + s))
-    alphas = f[1:] / f[:-1]
-    betas = 1 - alphas
-    assert len(betas) == T
-    return betas
+    f = torch.cos(0.5 * torch.pi * ((t / T) + s) / (1 + s)) ** 2
+    alpha = f[1:] / f[:-1]
+    beta = 1 - alpha
+    assert len(beta) == T
+    beta = torch.clamp(beta, max=0.999)
+    return beta
 
 @make_registrable()
 def linear_beta_schedule(T, beta_1=1e-4, beta_T=0.02):
-    betas = torch.linspace(beta_1, beta_T, T)
-    return betas
+    beta = torch.linspace(beta_1, beta_T, T)
+    return beta
 
 class NoiseScheduler(Model):
     ...
 
 
+class ContinuousNoiseScheduler(NoiseScheduler):
+    ...
+
+
+@NoiseScheduler.register("identity_continuous")
+class IdentityContinuousNoiseScheduler(ContinuousNoiseScheduler):
+    name = "identity"
+    def __init__(
+        self, 
+        beta_schedule: RegistrableFunction,
+        T: int = 1000) -> None:
+        super().__init__()
+        self.T = T
+        betas = beta_schedule(T)
+        alpha = 1 - betas
+        alpha_bar = torch.cumprod(alpha, 0)
+        
+        self.register_buffer('beta', betas)
+        self.register_buffer('alpha', alpha)
+        self.register_buffer('alpha_bar', alpha_bar)
+        
+    def get_alpha(self, t):
+        return torch.ones_like(self.alpha[t-1])
+
+    def get_alpha_bar(self, t):
+        return torch.ones_like(self.alpha_bar[t-1])
+    
+    def get_beta(self, t):
+        return torch.zeros_like(self.beta[t-1])
 
 @NoiseScheduler.register("gaussian_continuous")
-class GaussianContinuousNoiseScheduler(NoiseScheduler):
+class GaussianContinuousNoiseScheduler(ContinuousNoiseScheduler):
+    name = "gaussian"
     def __init__(
             self, 
             beta_schedule: RegistrableFunction,
@@ -44,13 +75,18 @@ class GaussianContinuousNoiseScheduler(NoiseScheduler):
         self.register_buffer('alpha', alpha)
         self.register_buffer('alpha_bar', alpha_bar)
         
-    def get_alphat(self, t):
+    def get_alpha(self, t):
+        assert (t > 0.5).all()
         return self.alpha[t-1]
 
-    def get_alphat_bar(self, t):
+    def get_alpha_bar(self, t):
+        assert (t > 0.5).all()
         return self.alpha_bar[t-1]
+    
+    def get_beta(self, t):
+        assert (t > 0.5).all()
+        return self.beta[t-1]
         
-
 
 @NoiseScheduler.register("discrete")
 class DiscreteNoiseScheduler(NoiseScheduler):
@@ -70,12 +106,15 @@ class DiscreteNoiseScheduler(NoiseScheduler):
         self.register_buffer("Q_bar", self._get_Q_bar(betas)) 
         
     def get_Qt(self, t):
+        assert (t > 0.5).all()
         return self.Q[t-1]
     
     def get_Qt_bar(self, t):
+        assert (t > 0.5).all()
         return self.Q_bar[t-1]
     
     def get_beta(self, t):
+        assert (t > 0.5).all()
         return self.beta[t-1]
 
 
@@ -170,45 +209,3 @@ class GaussianDiscreteNoiseScheduler(DiscreteNoiseScheduler):
             )
         Q_bar = torch.stack(Q_bar)
         return Q_bar
-    
-
-class Transition(Model):
-    default_implementation = "default"
-    
-    def __init__(
-        self,
-        node_scheduler: Lazy[NoiseScheduler],
-        edge_scheduler: Lazy[NoiseScheduler],
-        T: int = 1000,
-    ):
-        super().__init__()
-        self.T = T
-        self.node_scheduler = node_scheduler.construct(T=T)
-        self.edge_scheduler = edge_scheduler.construct(T=T)
-        
-    def transit(self, X, H, t):
-        X = self.transit_X(X, t)
-        H = self.transit_H(H, t)
-        
-        return DataContainer(X=X, H=H)
-    
-    def transit_X(self, X, t):
-        Qt_bar = self.node_scheduler.get_Qt_bar(t)
-        X_mn = F.one_hot(X, self.node_scheduler.n_classes).float()
-        X_prob = X_mn @ Qt_bar.unsqueeze(1)
-
-        X_prob = X_prob.view(-1, X_prob.size(-1))
-        X = X_prob.multinomial(1).view(*X.size())
-        
-        return X
-    
-    def transit_H(self, H, t):
-        Qt_bar = self.edge_scheduler.get_Qt_bar(t)
-        H_mn = F.one_hot(H, self.edge_scheduler.n_classes).float()
-        H_prob = H_mn @ Qt_bar.unsqueeze(1)
-
-        H_prob = H_prob.view(-1, H_prob.size(-1))
-        H = H_prob.multinomial(1).view(*H.size())
-        
-        return H
-Transition.register("default")(Transition)

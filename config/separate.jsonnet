@@ -13,14 +13,13 @@ local batch_size = 512;
       model: {
         type: 'diffusion',
         model: {
-          type: "hyper",
+          type: "separate",
           hidden_dim: hidden_dim,
           position_encoder: {
             type: "position",
             d_model: hidden_dim,
             max_len: T
           },
-          backbone: "pyg"
         },
         learning_rate: 1e-3,
         transition: {
@@ -31,20 +30,20 @@ local batch_size = 512;
             // n_classes: 256
           },
           edge_scheduler: {
-            type: "uniform_discrete",
-            beta_schedule: "linear_beta_schedule",
+            type: "identity_discrete",
+            beta_schedule: "cosine_beta_schedule",
             n_classes: 2,
           }
         },
         visualizer: {
-          type: "blender"
+          type: "matplotlib"
         }
       },
       data_module: {
         type: "cuboid",
         batch_size: batch_size,
       },
-      run_name: "cotrain"
+      run_name: null
     },
   },
 }

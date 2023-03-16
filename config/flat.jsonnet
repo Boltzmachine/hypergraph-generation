@@ -25,9 +25,8 @@ local batch_size = 512;
         transition: {
           T: T,
           node_scheduler: {
-            type: "gaussian_discrete",
+            type: "gaussian_continuous",
             beta_schedule: "linear_beta_schedule",
-            n_classes: 256
           },
           edge_scheduler: {
             type: "uniform_discrete",
@@ -43,6 +42,7 @@ local batch_size = 512;
         type: "cuboid",
         batch_size: batch_size,
       },
+      run_name: "flat"
     },
   },
 }

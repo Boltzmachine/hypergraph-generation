@@ -7,13 +7,13 @@ local batch_size = 512;
     train: {
       type: "train",
       trainer: {
-        max_epochs: 150,
+        max_epochs: 200,
         accelerator: "auto",
       },
       model: {
         type: 'diffusion',
         model: {
-          type: "hyper",
+          type: "hyper_initial",
           hidden_dim: hidden_dim,
           position_encoder: {
             type: "position",
@@ -31,8 +31,8 @@ local batch_size = 512;
             // n_classes: 256
           },
           edge_scheduler: {
-            type: "uniform_discrete",
-            beta_schedule: "linear_beta_schedule",
+            type: "identity_discrete",
+            beta_schedule: "cosine_beta_schedule",
             n_classes: 2,
           }
         },
@@ -44,7 +44,7 @@ local batch_size = 512;
         type: "cuboid",
         batch_size: batch_size,
       },
-      run_name: "cotrain"
+      run_name: "with init positions"
     },
   },
 }

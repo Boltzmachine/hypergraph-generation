@@ -25,13 +25,15 @@ class Train(Step):
         trainer: Lazy[LightningTrainer],
         model: Lazy[LightningModule],
         data_module: DataModule,
+        run_name: str = None,
     ) -> None:
         pl.seed_everything(42)
         model = model.construct(dist=HistDistribution(data_module.meta_info))
         
         logger = WandbLogger(
             project="hypergraph-generation",
-            save_dir="results/"
+            save_dir="results/",
+            name=run_name
         )
         logger.watch(model)
         
@@ -40,16 +42,20 @@ class Train(Step):
         trainer = trainer.construct(
             logger=logger, 
             # default_root_dir="results/ckpts/",
-            check_val_every_n_epoch=5,
+            check_val_every_n_epoch=10,
             gradient_clip_val=0.5,
             # gradient_clip_algorithm="value",
+            # num_sanity_val_steps=0,
             callbacks=[checkpoint_callback, LearningRateMonitor()]
         )
         trainer.fit(
             model,
             data_module
         )
-        # model.load_state_dict(torch.load("results/ckpts/epoch=54-step=1100.ckpt")['state_dict'])
+        # model.trainer = trainer
+        # model.trainer.datamodule = data_module
+        # data_module.setup(None)
+        # model.load_state_dict(torch.load("results/ckpts/epoch=59-step=1200.ckpt")['state_dict'])
         # model.to('cuda')
         # model.visualize_sequence()
         # # trainer.validate(

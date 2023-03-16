@@ -1,6 +1,9 @@
 import torch
+from scipy.stats import normaltest
+from matplotlib import pyplot as plt
 
-from src.noise_scheduler import UniformDiscreteNoiseScheduler, GaussianDiscreteNoiseScheduler, cosine_beta_schedule, linear_beta_schedule
+from src.dataset import CuboidDataset
+from src.noise_scheduler import UniformDiscreteNoiseScheduler, GaussianDiscreteNoiseScheduler, cosine_beta_schedule, linear_beta_schedule, GaussianContinuousNoiseScheduler
 
 import pytest
 
@@ -30,8 +33,26 @@ def test_stationary_uniform(K, scheduler_class, beta_schedule):
 
     Q_inf = scheduler.get_Qt_bar(T)
     assert torch.isclose(Q_inf, torch.ones_like(Q_inf) / K, atol=1e-3).all()
+
+
+def test_stationary_gaussian():
+    T = 500
+    bs = 10240
+    X = torch.stack([CuboidDataset.gen_verts() for _ in range(bs)])
+    scheduler = GaussianContinuousNoiseScheduler(linear_beta_schedule, T)
+    eps = torch.randn_like(X)
+    alpha_bar = scheduler.get_alpha_bar(torch.ones(X.size(0), dtype=torch.long) * T)[:, None, None]
+    X = torch.sqrt(alpha_bar) * X + torch.sqrt(1 - alpha_bar) * eps
+
+    true_normal = torch.randn_like(X).view(-1).numpy()
+    X = X.view(-1).numpy()
+    # plt.hist(X, bins=50)
+    # plt.savefig("1.png")
+
+    plt.hist(true_normal, bins=50)
+    plt.savefig("2.png")
     
 
 if __name__ == "__main__":
-    test_stationary_uniform(256, GaussianDiscreteNoiseScheduler)
-    
+    # test_stationary_uniform(256, GaussianDiscreteNoiseScheduler)
+    test_stationary_gaussian()

@@ -2,22 +2,12 @@ import numpy as np
 import torch
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.utils import to_dense_batch
+from torchvision.transforms.functional import to_pil_image
 
+from PIL import Image
 
 class VerticesMutedError(Exception):
     ...
-    
-
-def dequantize_verts(verts, n_bits=8, add_noise=False):
-    """Convert quantized vertices to floats."""
-    min_range = -0.5
-    max_range = 0.5
-    range_quantize = 2**n_bits - 1
-    verts = verts.float()
-    verts = verts * (max_range - min_range) / range_quantize + min_range
-    if add_noise:
-        verts += np.random.uniform(size=verts.shape) * (1 / range_quantize)
-    return verts
 
 
 class Quantizer:
@@ -35,9 +25,13 @@ class Quantizer:
         return x.long()
 
     def dequantize(self, x):
+        assert x.dtype == torch.long
         x = (x.float() - self.zeroPt) * self.scale
         x = x - 0.5
         return x
+    
+    def quantize2(self, x):
+        return self.dequantize(self.quantize(x))
     
 quantizer = Quantizer()
 
@@ -126,3 +120,11 @@ def prepare_for_loss_and_metrics(X, batch_X, H, batch_H, mask):
 def create_mask_from_length(length: torch.Tensor):
     mask = torch.arange(length.max(), device=length.device)[None, :] < length[:, None]
     return mask.long()
+
+
+def make_gif(frames, path):
+    frames = [to_pil_image(frame) for frame in frames[::5]]
+    frames = frames + [frames[-1]] * 50
+    frame_one = frames[0]
+    frame_one.save(f"{path}.gif", format="GIF", append_images=frames[1:],
+               save_all=True, duration=2, loop=0)
