@@ -10,7 +10,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from .diffusion import LightningModule, Diffusion
 from .dataset import Dataset, DataLoader, DataModule
-from .distributions import HistDistribution
+from .modules.distributions import HistDistribution
 
 
 class LightningTrainer(pl.Trainer, Registrable):
@@ -37,7 +37,7 @@ class Train(Step):
         )
         logger.watch(model)
         
-        checkpoint_callback = ModelCheckpoint(dirpath="results/ckpts/", save_top_k=2, monitor="val/node_mae")
+        checkpoint_callback = ModelCheckpoint(dirpath="results/ckpts/", save_top_k=2, monitor="val/edge_acc", mode='max')
         
         trainer = trainer.construct(
             logger=logger, 
@@ -52,6 +52,12 @@ class Train(Step):
             model,
             data_module
         )
+        # model.load_state_dict(torch.load("results/ckpts/epoch=99-step=2000.ckpt")['state_dict'])
+        # trainer.validate(
+        #     model,
+        #     data_module,
+        # )
+        
         # model.trainer = trainer
         # model.trainer.datamodule = data_module
         # data_module.setup(None)

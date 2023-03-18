@@ -2,7 +2,7 @@ import torch
 from src.dataset import DataContainer
 from src.diffusion import Diffusion
 from src.noise_scheduler import UniformDiscreteNoiseScheduler, Transition
-from src.model import DummyModel
+from src.modules.model import DummyModel
 
 from tango.common import Lazy
 

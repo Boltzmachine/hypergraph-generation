@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
+import seaborn as sns
 
 from tango.common import Registrable
 
@@ -199,3 +200,29 @@ class MatplotlibPlotter(Visualizer):
         plt.close()
         
         return image
+    
+@Visualizer.register("heatmap")
+class HeatmapVisualizer(Visualizer):
+    def __init__(self):
+        super().__init__()
+        
+    def visualize_object(self, x, h, idx=None):
+        device = h.device
+        fig = plt.figure(figsize=(3, 3), dpi=96)
+        canvas = FigureCanvas(fig)
+        ax = fig.add_subplot(111)
+        h = h.float().detach().cpu().numpy()
+        sns.heatmap(h, vmin=0., vmax=1., ax=ax)
+        
+        canvas.draw()
+        width, height = fig.get_size_inches() * fig.get_dpi()
+        width = width.astype(int)
+        height = height.astype(int)
+        image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8').reshape(height, width, 3) 
+        image = torch.from_numpy(image)
+        image = image.to(device).permute(2, 0, 1)
+        image = resize(image, (256, 256))
+        
+        plt.close()
+        return image
+        

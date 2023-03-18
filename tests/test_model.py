@@ -1,5 +1,5 @@
 import torch
-from src.model import HyperModel, PositionalEncoding
+from src.modules.model import HyperModel, PositionalEncoding
 
 def test_model_equivariant():
     model = HyperModel(128, PositionalEncoding(128, 500))

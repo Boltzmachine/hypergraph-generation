@@ -13,7 +13,7 @@ local batch_size = 512;
       model: {
         type: 'diffusion',
         model: {
-          type: "cuboid",
+          type: "flat",
           hidden_dim: hidden_dim,
           position_encoder: {
             type: "position",
@@ -29,9 +29,9 @@ local batch_size = 512;
             beta_schedule: "linear_beta_schedule",
           },
           edge_scheduler: {
-            type: "uniform_discrete",
+            type: "gaussian_continuous",
             beta_schedule: "cosine_beta_schedule",
-            n_classes: 2,
+            // n_classes: 2,
           }
         },
         visualizer: {

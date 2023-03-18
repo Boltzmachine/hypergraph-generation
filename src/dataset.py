@@ -116,6 +116,7 @@ class CuboidDataset(Dataset):
     @staticmethod
     def gen_verts():
         edges = torch.rand(3) * 18 + 2 # 3
+        # edges = torch.tensor([3.,4.,5.])
         diag = torch.norm(edges)
 
         edges = edges / diag

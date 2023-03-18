@@ -91,14 +91,17 @@ def masked_select_X(X, mask):
     
 def masked_select_H(H, mask):
     """
-    H - [bs, n_hyper, n_nodes]
+    H - [bs, n_hyper, n_nodes] or [bs, n_hyper, n_nodes, 2]
     mask - [bs, n_nodes]
     
     return H - [bs * n_nodes, n_hyper]
     """
-    assert H.dim() == 3
     mask = mask.bool()
-    return torch.masked_select(H.transpose(1, 2), mask[..., None]).view(-1, H.size(1))
+    if H.dim() == 3:
+        return torch.masked_select(H.transpose(1, 2), mask[..., None]).view(-1, H.size(1))
+    elif H.dim() == 4:
+        raise NotImplementedError
+        return torch.masked_select(H.transpose(1, 2), mask[..., None, None]).view(-1, H.size(1)).transpose(1, -1)
 
 
 def prepare_for_loss_and_metrics(X, batch_X, H, batch_H, mask):
@@ -123,8 +126,26 @@ def create_mask_from_length(length: torch.Tensor):
 
 
 def make_gif(frames, path):
-    frames = [to_pil_image(frame) for frame in frames[::5]]
-    frames = frames + [frames[-1]] * 50
+    frames = [to_pil_image(frame) for frame in frames[::5]] + [frames[-1]]
+    frames = frames
     frame_one = frames[0]
     frame_one.save(f"{path}.gif", format="GIF", append_images=frames[1:],
-               save_all=True, duration=2, loop=0)
+               save_all=True, duration=2)
+    
+def get_offset(batch_idx, indicator):
+    if isinstance(indicator, int):
+        offset = batch_idx * indicator
+    elif isinstance(indicator, torch.Tensor):
+        assert indicator.dim() == 2
+        indicator = indicator.sum(1).cumsum(0)
+        indicator = torch.roll(indicator, 1)
+        indicator[0] = 0
+        offset = indicator[batch_idx]
+    return offset
+
+def create_mask_if_not_exist(mask, x_ref):
+    if mask is not None:
+        return mask
+    else:
+        mask = torch.ones(x_ref.size(0), x_ref.size(1), dtype=torch.long, device=x_ref.device)
+        return mask
