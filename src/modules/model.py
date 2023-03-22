@@ -96,7 +96,7 @@ class FlatModel(Model):
         # [bs, n_nodes, 3, hidden_dim]
         X = self.node_embedder(X)
         # [bs, n_hyper, n_nodes, hidden_dim]
-        H = self.edge_embedder(H.unsqueeze(-1))
+        H = self.edge_embedder(H.unsqueeze(-1).float())
         
         X = X.view(bs, -1)
         H = H.view(bs, -1)
@@ -156,7 +156,9 @@ class EdgeGNNConv(Model):
         self.hidden_dim = hidden_dim
         aggr = ['mean', 'sum', 'std', 'max', 'min']
         # aggr = 'mean'
-        self.conv = pyg_nn.GENConv(hidden_dim, hidden_dim)#, aggr=aggr)
+        # self.conv = pyg_nn.GENConv(hidden_dim, hidden_dim)#, aggr=aggr)
+        self.conv = MeshConv(hidden_dim, hidden_dim, aggr=aggr)
+        self.norm = pyg_nn.norm.LayerNorm(hidden_dim)
         self.edge_transform = nn.Sequential(
             nn.Linear(1, hidden_dim),
             nn.LeakyReLU(),
@@ -186,11 +188,15 @@ class EdgeGNNConv(Model):
         edge_index[:, 0] += src_offset
         edge_index[:, 1] += tgt_offset
         edge_index = edge_index.T
-        x_src = x_src.view(-1, hidden_dim)
-        x_tgt = x_tgt.view(-1, hidden_dim)
+        x_src = x_src[src_mask.bool()]
+        x_tgt = x_tgt[tgt_mask.bool()]
         
-        x_tgt = self.conv((x_src, x_tgt), edge_index, edge_attr)
-        x_tgt = x_tgt.view(bs, n_tgt_nodes, hidden_dim)
+        batch = torch.arange(bs, device=x_tgt.device).repeat_interleave(tgt_mask.sum(1))
+        
+        x_tgt = self.norm(self.conv((x_src, x_tgt), edge_index, edge_attr), batch) + x_tgt
+
+        x_tgt, mask = to_dense_batch(x_tgt, batch)
+        assert (mask == tgt_mask).all()
 
         return x_tgt
 
@@ -326,10 +332,10 @@ class HyperModel(Model):
         
         for conv in self.convs:
             # [bs, n_hyper, hidden_dim]
-            face_emb = conv[0](vertex_emb, face_emb, H.transpose(1, 2), src_mask=mask, tgt_mask=None) + face_emb
+            face_emb = conv[0](vertex_emb, face_emb, H.transpose(1, 2), src_mask=mask, tgt_mask=None)# + face_emb
             face_emb = conv[2](face_emb) + face_emb
             # [bs, n_node, hidden_dim]
-            vertex_emb = conv[1](face_emb, vertex_emb, H, src_mask=None, tgt_mask=mask) + vertex_emb
+            vertex_emb = conv[1](face_emb, vertex_emb, H, src_mask=None, tgt_mask=mask)# + vertex_emb
             vertex_emb = conv[3](vertex_emb) + vertex_emb
             
         # [bs, n_hyper, n_nodes, 2 * hidden_dim]
@@ -601,3 +607,26 @@ class SeparateModel(Model):
         H = self.edge_head(edge_emb.view(bs, n_hyper * n_nodes, -1)).squeeze().view(bs, n_hyper, n_nodes)
         
         return X, H_
+
+from copy import deepcopy
+
+@Model.register("multi-stage")
+class MultiStageModel(Model):
+    def __init__(self, model: Model) -> None:
+        super().__init__()
+        self.model1 = model
+        self.model2 = deepcopy(model)
+        self.model3 = deepcopy(model)
+
+    def forward(self, X, H, t, mask):
+        X1, H1 = self.model1(X, H, t, mask)
+        X2, H2 = self.model2(X, H, t, mask)
+        X3, H3 = self.model3(X, H, t, mask)
+
+        X = self.mask_add(t, X1, X2, X3)
+        H = self.mask_add(t, H1, H2, H3)
+        return X, H
+
+    def mask_add(self, t, out1, out2, out3):
+        out = (t <= 25)[:, None, None] * out1 + ((25 < t) & (t <= 125))[:, None, None] * out2 + (125 < t)[:, None, None] * out3
+        return out

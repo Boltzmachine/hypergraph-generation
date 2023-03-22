@@ -5,6 +5,7 @@ import h5py
 import json
 import dataclasses
 from collections import abc, namedtuple
+from tqdm import tqdm
 
 import torch
 from torch_geometric.data import Data, HeteroData
@@ -116,7 +117,6 @@ class CuboidDataset(Dataset):
     @staticmethod
     def gen_verts():
         edges = torch.rand(3) * 18 + 2 # 3
-        # edges = torch.tensor([3.,4.,5.])
         diag = torch.norm(edges)
 
         edges = edges / diag
@@ -136,7 +136,6 @@ def mask_collate_fn(batchs):
         batch['X'] = torch.cat([X, torch.zeros(pad_len, X.size(1), dtype=X.dtype)], dim=0)
         H = batch['H']
         batch['H'] = torch.cat([H, torch.zeros(H.size(0), pad_len, dtype=H.dtype)], dim=1)
-
 
     return default_collate(batchs)
     
@@ -198,7 +197,7 @@ class ShapenetDataModule(DataModule):
             keys = [(subset, k) for k in file[subset].keys()]
         else:
             raise NotImplementedError
-        self.keys = keys
+        self.keys = keys[:1]
         self.subset = subset
     
     def setup(self, stage: str):
@@ -206,9 +205,14 @@ class ShapenetDataModule(DataModule):
         val_len = int(0.1 * len(dataset))
 
         # from tqdm import tqdm
-        # num_faces = [data['H'].shape[0] for data in tqdm(dataset)]
+        # pos = 0
+        # neg = 0
+        # for data in tqdm(dataset):
+        #     pos += data['H'].sum()
+        #     neg += (1 - data['H']).sum()
 
         self.train, self.val = random_split(dataset, [len(dataset) - val_len, val_len])
+        self.val = self.train
         
     def train_dataloader(self):
         return DataLoader(self.train, batch_size=self.batch_size, collate_fn=mask_collate_fn, num_workers=self.num_workers)

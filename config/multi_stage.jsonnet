@@ -1,5 +1,5 @@
-local hidden_dim = 8;
-local T = 500;
+local hidden_dim = 128;
+local T = 300;
 local batch_size = 512;
 
 {
@@ -9,17 +9,30 @@ local batch_size = 512;
       trainer: {
         max_epochs: 200,
         accelerator: "auto",
+        check_val_every_n_epoch: 10,
       },
       model: {
         type: 'diffusion',
         model: {
-          type: "flat",
-          hidden_dim: hidden_dim,
-          position_encoder: {
-            type: "sin",
-            d_model: 10 * hidden_dim,
-            max_len: T
+          type: "multi-stage",
+          model: {
+            type: "hyper",
+            hidden_dim: hidden_dim,
+            position_encoder: {
+              type: "sin",
+              d_model: hidden_dim,
+              max_len: T
+            },
+            backbone: "pyg"
           }
+        },
+        node_criterion: {
+          type: "mse",
+          reduction: "none"
+        },
+        edge_criterion: {
+          type: "bce",
+          reduction: "none"
         },
         learning_rate: 1e-3,
         transition: {
@@ -27,6 +40,7 @@ local batch_size = 512;
           node_scheduler: {
             type: "gaussian_continuous",
             beta_schedule: "linear_beta_schedule",
+            // n_classes: 256
           },
           edge_scheduler: {
             type: "uniform_discrete",
@@ -42,7 +56,7 @@ local batch_size = 512;
         type: "cuboid",
         batch_size: batch_size,
       },
-      run_name: "flat"
+      run_name: "multi-stage"
     },
   },
 }

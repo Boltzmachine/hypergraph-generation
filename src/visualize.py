@@ -128,7 +128,7 @@ class BlenderRenderer(Visualizer):
         outpath = f"results/render/{ind}.png"
         bpy.context.scene.render.filepath = outpath
         bpy.ops.render.render(write_still=True)  # save straight to file
-        # self.save_file(f"results/blender/{ind}.blend")
+        self.save_file(f"results/blender/{ind}.blend")
         
         bpy.ops.object.delete()
         if len(bpy.data.objects) > 4:

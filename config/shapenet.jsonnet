@@ -1,4 +1,4 @@
-local hidden_dim = 512;
+local hidden_dim = 64;
 local T = 500;
 local batch_size = 2;
 
@@ -8,8 +8,9 @@ local batch_size = 2;
     train: {
       type: "train",
       trainer: {
-        max_epochs: 200,
+        max_epochs: 2000,
         accelerator: "auto",
+        check_val_every_n_epoch: 100,
       },
       model: {
         type: 'diffusion',
@@ -17,26 +18,36 @@ local batch_size = 2;
           type: "hyper",
           hidden_dim: hidden_dim,
           position_encoder: {
-            type: "position",
+            type: "mlp",
             d_model: hidden_dim,
             max_len: T
           },
           backbone: "pyg"
         },
-        learning_rate: 1e-3,
+        node_criterion: {
+          type: "mse",
+          reduction: "none"
+        },
+        edge_criterion: {
+          type: "bce",
+          reduction: "none",
+          pos_weight: 20,#283.38,
+        },
+        learning_rate: 3e-4,
         transition: {
           T: T,
           node_scheduler: {
-            type: "gaussian_continuous",
+            type: "identity_continuous",
             beta_schedule: "linear_beta_schedule",
             // n_classes: 256
           },
           edge_scheduler: {
-            type: "identity_discrete",
-            beta_schedule: "cosine_beta_schedule",
+            type: "uniform_discrete",
+            beta_schedule: "linear_beta_schedule",
             n_classes: 2,
           }
-        }
+        },
+        sample_bs: 1
       },
       data_module: {
         type: "shapenet",

@@ -111,13 +111,13 @@ class Transition(Model):
         X0 is actually eps here
         """
         X0, Xt = X
-        z = torch.randn_like(Xt) if deterministic else 0
+        z = 0 if deterministic else torch.randn_like(Xt)
 
         alpha = self.node_scheduler.get_alpha(t)[:, None, None]
         alpha_bar = self.node_scheduler.get_alpha_bar(t)[:, None, None]
         beta = self.node_scheduler.get_beta(t)[:, None, None]
 
-        X = 1. / torch.sqrt(alpha) * (Xt - (1-alpha)/(1e-10+torch.sqrt(1 - alpha_bar)) * X0) + torch.sqrt(beta) * z
+        X = 1. / torch.sqrt(alpha) * (Xt - (1-alpha)/torch.sqrt(1 - alpha_bar) * X0) + torch.sqrt(beta) * z
 
         return X
             

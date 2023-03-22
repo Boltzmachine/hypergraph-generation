@@ -7,6 +7,7 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.profiler import PyTorchProfiler
 
 from .diffusion import LightningModule, Diffusion
 from .dataset import Dataset, DataLoader, DataModule
@@ -42,15 +43,15 @@ class Train(Step):
         trainer = trainer.construct(
             logger=logger, 
             # default_root_dir="results/ckpts/",
-            check_val_every_n_epoch=10,
             gradient_clip_val=0.5,
             # gradient_clip_algorithm="value",
             # num_sanity_val_steps=0,
-            callbacks=[checkpoint_callback, LearningRateMonitor()]
+            callbacks=[checkpoint_callback, LearningRateMonitor()],
+            # profiler=PyTorchProfiler(filename="profile"),
         )
         trainer.fit(
             model,
-            data_module
+            data_module,
         )
         # model.load_state_dict(torch.load("results/ckpts/epoch=99-step=2000.ckpt")['state_dict'])
         # trainer.validate(
