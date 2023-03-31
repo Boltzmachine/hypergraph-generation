@@ -87,19 +87,23 @@ class BlenderRenderer(Visualizer):
         bpy.ops.mesh.edge_face_add()
 
     @stdout_suppress()
-    def visualize_object(self, x, h, idx=None):
+    def visualize_object(self, x, h, m, idx=None):
         in_mem_dir = "/dev/shm" # store file in memory so it would be faster and still compatible to API
         temp_dir = "hypergen_render"
         dir_path = os.path.join(in_mem_dir, temp_dir)
         dir_path = "./results/wavefront"
         obj_path = os.path.join(dir_path, f"{idx}.obj")
-        # This face's index is form 0 istead of 1!
+
+        h = h * m[None, :]
+        x = x[m.bool()]        
         
+        # This face's index is form 0 istead of 1!
         h = torch.unique(h, dim=0, sorted=False)
         faces = []
         for face in h:
             face = face.nonzero(as_tuple=True)[0].tolist()
-            faces.append(face)
+            if len(face) > 0:
+                faces.append(face)
         
         with open(obj_path, 'w') as file:
             for vert in x.tolist():

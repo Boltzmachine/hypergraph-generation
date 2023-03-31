@@ -14,19 +14,18 @@ import torchmetrics
 import torchvision
 from torchvision.utils import make_grid, save_image
 
-from .dataset import DataContainer, CuboidDataset, quantizer, mask_collate_fn
+from .dataset import DataContainer, CuboidDataset, quantizer
 from .transition import Transition
 from .visualize import BlenderRenderer, MatplotlibPlotter, Visualizer
 from .utils import VerticesMutedError, masked_select_H, masked_select_X, prepare_for_loss_and_metrics, create_mask_from_length, make_gif
 from .modules.distributions import Distribution
-from .modules.model import HyperInitialModel
 from .modules.criterion import Criterion
 from .noise_scheduler import DiscreteNoiseScheduler, ContinuousNoiseScheduler
 
 from tango.integrations.torch import Model
 from tango.common.registrable import Registrable
 
-from typing import Any, Union, List
+from typing import Any, Union, List, Optional
 
 
 def scatter_loss_per_step(loss, mask):
@@ -93,9 +92,9 @@ class Diffusion(pl.LightningModule):
             model: Model,
             learning_rate: float,
             transition: Transition,
-            dist: Distribution,
-            edge_criterion: Criterion,
-            node_criterion: Criterion,
+            dist: Optional[Distribution] = None,
+            edge_criterion: Optional[Criterion] = None,
+            node_criterion: Optional[Criterion] = None,
             visualizer: Union[Visualizer, List[Visualizer]] = BlenderRenderer(),
             sample_bs: int = 16,
             ) -> None:
@@ -116,8 +115,8 @@ class Diffusion(pl.LightningModule):
         # self.node_acc = torchmetrics.Accuracy(task="multiclass", num_classes=transition.node_scheduler.n_classes)
         self.node_mae = torchmetrics.MeanAbsoluteError()
         
-        self.node_ema = StepEMA(transition.T, "node")
-        self.edge_ema = StepEMA(transition.T, "edge")
+        # self.node_ema = StepEMA(transition.T, "node")
+        # self.edge_ema = StepEMA(transition.T, "edge")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
@@ -165,26 +164,31 @@ class Diffusion(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         pred_X, true_X, pred_H, true_H, t, mask = self.shared_step(batch, batch_idx)
 
-        edge_loss = self.edge_criterion(pred_H, true_H.float())
+        edge_loss = self.edge_criterion(pred_H.unsqueeze(-1), true_H.float().unsqueeze(-1))
         node_loss = self.node_criterion(pred_X, true_X)
 
         # reweight = (1 - torch.repeat_interleave(t, mask.sum(1)) / self.transition.T) * 2
         # assert (reweight >= 0).all()
         # node_loss = (node_loss * reweight[:, None]).mean()
         # edge_loss = (edge_loss * reweight[:, None])
-        edge_loss = edge_loss.mean(-1)
+        edge_loss = edge_loss.mean(-1).mean(-1)
         node_loss = node_loss.mean(-1)# * 3
                 
-        self.node_ema.update(t, scatter_loss_per_step(node_loss, mask))
-        self.edge_ema.update(t, scatter_loss_per_step(edge_loss, mask))
+        # self.node_ema.update(t, scatter_loss_per_step(node_loss, mask))
+        # self.edge_ema.update(t, scatter_loss_per_step(edge_loss, mask))
         
         edge_loss = edge_loss.mean()
         node_loss = node_loss.mean()# * 3
 
         self.log("train/node_loss", node_loss)
         self.log("train/edge_loss", edge_loss)
+        
+        if self.transition.edge_scheduler.name == "identity" and self.transition.node_scheduler.name == "identity":
+            loss = torch.zeros(1, device=pred_X.device, requires_grad=True)
+        else:
+            loss = node_loss + edge_loss
 
-        return node_loss + edge_loss
+        return loss
     
     
     def validation_step(self, batch, batch_idx):
@@ -202,11 +206,13 @@ class Diffusion(pl.LightningModule):
         # self.log("val/node_acc", self.node_acc)
         self.log("val/node_mae", self.node_mae)
         self.log("val/edge_acc", self.edge_acc)
-        self.node_ema.log()
-        self.edge_ema.log()
+        # self.node_ema.log()
+        # self.edge_ema.log()
 
-        X, H = self.sample_batch(bs=self.sample_bs, fake_sample=2)
-        images = self.render_samples(quantizer.quantize2(X), H)
+        X, H, mask = self.sample_batch(bs=self.sample_bs)        
+        X = quantizer.quantize2(X)
+        
+        images = self.render_samples(X, H, mask)
         grid = make_grid(images, nrow=4)
         grid = grid.float()
         wandb.log({
@@ -237,7 +243,14 @@ class Diffusion(pl.LightningModule):
         
     def forward(self, X, H, t, mask, **kwargs):
         # X = quantizer.dequantize(X)
+        """
+        X - [bs, n_nodes, 3]
+        H - [bs, n_hyper, n_nodes]
+        mask - [bs, n_nodes]
+        """
         X, H = self.model(X, H, t, mask, **kwargs)
+        X = X * mask[..., None]
+        H = H * mask[:, None, :]
   
         return X, H
     
@@ -255,13 +268,14 @@ class Diffusion(pl.LightningModule):
     def sample_batch(self, bs: int = 16, device = torch.device('cuda' if torch.cuda.is_available() else "cpu"), return_every_step: bool = False, fake_sample: Union[int, bool] = False):
         n_nodes = self.dist.sample_n(bs, device)
         max_nodes = n_nodes.max()
+        collate_fn = self.trainer.datamodule.collate_fn
 
         sample_start = self.transition.T
         if return_every_step:
             pr = []
         if fake_sample:
             sample_start = fake_sample
-            datalist = mask_collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
+            datalist = collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
             X = datalist['X'].to(device)
             mask = datalist['mask'].to(device)
             H = datalist['H'].to(device)
@@ -277,7 +291,7 @@ class Diffusion(pl.LightningModule):
 
         else:
             if self.transition.node_scheduler.name == "identity" or self.transition.edge_scheduler.name == "identity":
-                datalist = mask_collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
+                datalist = collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
                 n_nodes = datalist['mask'].sum(1).to(device)
                 max_nodes = n_nodes.max()
             if self.transition.node_scheduler.name == "identity":
@@ -313,18 +327,18 @@ class Diffusion(pl.LightningModule):
             assert len(gt) == len(pr) + 1
             return gt, pr
         else:
-            return X, H
+            return X, H, mask
     
-    def render_samples(self, X, H):
+    def render_samples(self, X, H, mask):
         # shutil.rmtree(dir_path)
         # os.makedirs(dir_path, exist_ok=True)
         
         # write obj
         # obj_paths = []
         images = []
-        for i, (x, h) in enumerate(zip(list(X), list(H))):
+        for i, (x, h, m) in enumerate(zip(list(X), list(H), list(mask))):
             try:
-                image = self.visualizer.visualize_object(x, h, i)
+                image = self.visualizer.visualize_object(x, h, m, i)
             except VerticesMutedError:
                 image = torch.zeros(4, 256, 256, dtype=torch.uint8)
             images.append(image)
@@ -334,13 +348,11 @@ class Diffusion(pl.LightningModule):
     
     def construct_forward_kwargs(self, **kwargs):
         forward_kwargs = {}
-        if isinstance(self.model, HyperInitialModel):
-            forward_kwargs["XT"] = kwargs["XT"]
         return forward_kwargs
     
     def plot_every_step_loss(self, bs: int = 256, device = torch.device('cuda' if torch.cuda.is_available() else "cpu")):
         import matplotlib.pyplot as plt
-        batch = mask_collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
+        batch = self.trainer.datamodule.collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 12))
         H_mse = []
         X_mse = []

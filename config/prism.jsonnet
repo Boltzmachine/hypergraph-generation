@@ -7,7 +7,7 @@ local batch_size = 512;
     train: {
       type: "train",
       trainer: {
-        max_epochs: 500,
+        max_epochs: 200,
         accelerator: "auto",
         check_val_every_n_epoch: 10,
       },
@@ -49,10 +49,10 @@ local batch_size = 512;
         }
       },
       data_module: {
-        type: "cuboid",
+        type: "prism",
         batch_size: batch_size,
       },
-      run_name: "cuboid"
+      run_name: "prism"
     },
   },
 }

@@ -6,6 +6,7 @@ import json
 import dataclasses
 from collections import abc, namedtuple
 from tqdm import tqdm
+import random
 
 import torch
 from torch_geometric.data import Data, HeteroData
@@ -123,25 +124,71 @@ class CuboidDataset(Dataset):
         verts = torch.stack([edges/2, -edges/2], dim=1) # 3x2
         verts = torch.cartesian_prod(verts[0], verts[1], verts[2])
         return verts
+    
 
+@Dataset.register("prism")
+class PrismDataset(Dataset):
+    def __init__(self, length: int, min_verts: int = 3, max_verts: int = 4) -> None:
+        super().__init__()
+        self.length = length
+        self.min_verts = min_verts
+        self.max_verts = max_verts
 
-def mask_collate_fn(batchs):
-    max_num_nodes = max([batch['X'].size(0) for batch in batchs])
-    for batch in batchs:
-        X = batch['X']
-        pad_len = max_num_nodes - X.size(0)
-        mask = torch.zeros(max_num_nodes, dtype=torch.long)
-        mask[:X.size(0)] = 1
-        batch['mask'] = mask
-        batch['X'] = torch.cat([X, torch.zeros(pad_len, X.size(1), dtype=X.dtype)], dim=0)
-        H = batch['H']
-        batch['H'] = torch.cat([H, torch.zeros(H.size(0), pad_len, dtype=H.dtype)], dim=1)
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        n = random.randint(3, 4)
 
-    return default_collate(batchs)
+        theta = torch.linspace(0, 2 * torch.pi, n+1)[:-1]
+
+        x = torch.cos(theta) * 0.5
+        y = torch.sin(theta) * 0.5
+
+        z = random.random() * 0.4 + 0.1
+
+        verts1 = torch.stack([x, -torch.ones_like(x) * z, y], dim=1)
+        verts2 = torch.stack([x, torch.ones_like(x) * z, y], dim=1)
+
+        verts = torch.cat([verts1, verts2], dim=0)
+
+        face = torch.zeros(n+2, 2 * n, dtype=torch.long)
+        face[0, :n] = 1
+        face[1, n:] = 1
+
+        idx2 = (torch.tensor([0, 1, n, n+1])[None, :] + torch.arange(n)[:, None]) % (2 * n)
+        idx2 = idx2.view(-1)
+        idx1 = torch.arange(n).repeat_interleave(4)
+        face[idx1+2, idx2] = 1
+
+        return {
+            "X": verts,
+            "H": face,
+        }
+        
+
+def get_mask_collate_fn_by_max_face(max_face = None):
+    
+    def mask_collate_fn(batchs):
+        max_num_nodes = max([batch['X'].size(0) for batch in batchs])
+        for batch in batchs:
+            X = batch['X']
+            pad_len = max_num_nodes - X.size(0)
+            mask = torch.zeros(max_num_nodes, dtype=torch.long)
+            mask[:X.size(0)] = 1
+            batch['mask'] = mask
+            batch['X'] = torch.cat([X, torch.zeros(pad_len, X.size(1), dtype=X.dtype)], dim=0)
+            H = batch['H']
+            H = torch.cat([H, torch.zeros(H.size(0), pad_len, dtype=H.dtype)], dim=1)
+            batch['H'] = torch.cat([H, torch.zeros(max_face - H.size(0), H.size(1), dtype=H.dtype)], dim=0)
+
+        return default_collate(batchs)
+    
+    return mask_collate_fn
     
     
 class DataModule(pl.LightningDataModule, Registrable):
-    ...
+    collate_fn = default_collate
     
     
 @DataModule.register("cuboid")
@@ -174,6 +221,48 @@ class CuboidDataModule(DataModule):
             'n_nodes': [8] * length,
         }
     
+
+@DataModule.register("prism")
+class PrismDataModule(DataModule):
+    def __init__(
+            self, 
+            batch_size: int = 32,
+            min_verts: int = 3,
+            max_verts: int = 8,
+        ):
+        super().__init__()
+        self.batch_size = batch_size
+        self.min_verts = min_verts
+        self.max_verts = max_verts
+        
+        self.train_len = 10000
+        self.val_len = 100
+        
+        max_face = max(self.meta_info['n_faces'])
+        self.collate_fn = get_mask_collate_fn_by_max_face(max_face)
+
+    def setup(self, stage: str):
+        self.train = PrismDataset(self.train_len, self.min_verts, self.max_verts)
+        self.val = PrismDataset(self.val_len, self.min_verts, self.max_verts)
+
+    def train_dataloader(self):
+        return DataLoader(self.train, batch_size=self.batch_size, collate_fn=self.collate_fn)
+
+    def val_dataloader(self):
+        return DataLoader(self.val, batch_size=self.batch_size, collate_fn=self.collate_fn)
+    
+    @property
+    def meta_info(self):
+        length = self.train_len + self.val_len
+        n_range = self.max_verts - self.min_verts + 1
+        rtime = length // n_range
+
+        return {
+            'n_faces': [n + 2 for n in range(self.min_verts, self.max_verts+1)] * rtime,
+            'n_nodes': [2 * n for n in range(self.min_verts, self.max_verts+1)] * rtime,
+        }
+    
+
 
 @DataModule.register("shapenet")
 class ShapenetDataModule(DataModule):
