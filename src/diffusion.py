@@ -93,6 +93,7 @@ class Diffusion(pl.LightningModule):
             learning_rate: float,
             transition: Transition,
             dist: Optional[Distribution] = None,
+            face_criterion: Optional[Criterion] = None,
             edge_criterion: Optional[Criterion] = None,
             node_criterion: Optional[Criterion] = None,
             visualizer: Union[Visualizer, List[Visualizer]] = BlenderRenderer(),
@@ -103,16 +104,19 @@ class Diffusion(pl.LightningModule):
         self.model = model
         self.learning_rate = learning_rate
         self.transition = transition
-        self.edge_criterion = edge_criterion
+        self.face_criterion = face_criterion
         self.node_criterion = node_criterion
+        self.edge_criterion = edge_criterion
         self.dist = dist
         self.visualizer = visualizer
         self.sample_bs = sample_bs
+
+        self.do_face = face_criterion is not None
+        self.do_edge = edge_criterion is not None
+        assert (self.do_face or self.do_edge)
+        assert not (self.do_face and self.do_edge)
         
-        self.edge_acc = torchmetrics.Accuracy(task="binary")
-        # self.edge_acc = torchmetrics.MeanAbsoluteError()
-        # self.edge_acc = torchmetrics.Accuracy(task="multiclass", num_classes=transition.edge_scheduler.n_classes)
-        # self.node_acc = torchmetrics.Accuracy(task="multiclass", num_classes=transition.node_scheduler.n_classes)
+        self.edge_acc = torchmetrics.Accuracy(task="binary") if self.do_face else torchmetrics.Accuracy(task="multiclass", num_classes=transition.edge_scheduler.n_classes)
         self.node_mae = torchmetrics.MeanAbsoluteError()
         
         # self.node_ema = StepEMA(transition.T, "node")
@@ -137,19 +141,21 @@ class Diffusion(pl.LightningModule):
         step shared by training and validation
         """
         X = batch['X']
+        E = batch['E']
         H = batch['H']
         mask = batch['mask']
         
         if t is None:
             t = torch.randint(1, self.transition.T+1, size=(X.size(0),), device=X.device)
         
-        XT, _ = self.transit(X, H, torch.ones_like(t) * self.transition.T)[0]
-        forward_kwargs = self.construct_forward_kwargs(XT=XT)
+        # XT, _ = self.transit(X, H, torch.ones_like(t) * self.transition.T)[0]
+        forward_kwargs = self.construct_forward_kwargs()
         
-        (X, X_noise), (H, H_noise) = self.transit(X, H, t)
-        pred_X, pred_H = self.forward(X, H, t, mask, **forward_kwargs)
+        (X, X_noise), (E, E_noise), (H, H_noise) = self.transit(X, E, H, t)
+
+        pred_X, pred_E, pred_H = self.forward(X, E, H, t, mask, **forward_kwargs)
         
-        pred_X, true_X, pred_H, true_H = prepare_for_loss_and_metrics(pred_X, X_noise, pred_H, H_noise, mask)
+        pred_X, true_X, pred_E, true_E, pred_H, true_H = prepare_for_loss_and_metrics(pred_X, X_noise, pred_E, E_noise, pred_H, H_noise, mask)
         
         if self.transition.node_scheduler.name == "identity":
             pred_X = true_X
@@ -157,16 +163,20 @@ class Diffusion(pl.LightningModule):
             if isinstance(self.transition.edge_scheduler, ContinuousNoiseScheduler):
                 pred_H = true_H
             else:
-                pred_H =  true_H * 2e10 - 1e10
+                pred_H = true_H * 2e10 - 1e10
+                pred_E = F.one_hot(true_E, num_classes=2).float() * 2e10 - 1e10
         
-        return pred_X, true_X, pred_H, true_H, t, mask
+        return pred_X, true_X, pred_E, true_E, pred_H, true_H, t, mask
         
     def training_step(self, batch, batch_idx):
-        pred_X, true_X, pred_H, true_H, t, mask = self.shared_step(batch, batch_idx)
+        pred_X, true_X, pred_E, true_E, pred_H, true_H, t, mask = self.shared_step(batch, batch_idx)
 
-        edge_loss = self.edge_criterion(pred_H.unsqueeze(-1), true_H.float().unsqueeze(-1))
+        if self.do_face:
+            edge_loss = self.face_criterion(pred_H.unsqueeze(-1), true_H.float().unsqueeze(-1))
+        if self.do_edge:
+            edge_loss = self.edge_criterion(pred_E, true_E)
+
         node_loss = self.node_criterion(pred_X, true_X)
-
         # reweight = (1 - torch.repeat_interleave(t, mask.sum(1)) / self.transition.T) * 2
         # assert (reweight >= 0).all()
         # node_loss = (node_loss * reweight[:, None]).mean()
@@ -193,14 +203,15 @@ class Diffusion(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         # t = torch.ones(batch['X'].size(0), dtype=torch.long, device=batch['X'].device)
-        pred_X, true_X, pred_H, true_H, t, mask = self.shared_step(batch, batch_idx)
+        pred_X, true_X, pred_E, true_E, pred_H, true_H, t, mask = self.shared_step(batch, batch_idx)
 
-        # pred_H = (pred_H > 0).long()
-        # true_H = (true_H > 0).long()
-        self.edge_acc(pred_H, true_H)
+        if self.do_face:
+            self.edge_acc(pred_H, true_H)
+        if self.do_edge:
+            self.edge_acc(pred_E, true_E)
+
         self.node_mae(pred_X, true_X)
 
-        return 
 
     def on_validation_epoch_end(self) -> None:
         # self.log("val/node_acc", self.node_acc)
@@ -209,10 +220,10 @@ class Diffusion(pl.LightningModule):
         # self.node_ema.log()
         # self.edge_ema.log()
 
-        X, H, mask = self.sample_batch(bs=self.sample_bs)        
+        X, E, H, mask = self.sample_batch(bs=self.sample_bs)        
         X = quantizer.quantize2(X)
         
-        images = self.render_samples(X, H, mask)
+        images = self.render_samples(X, E, H, mask)
         grid = make_grid(images, nrow=4)
         grid = grid.float()
         wandb.log({
@@ -241,28 +252,28 @@ class Diffusion(pl.LightningModule):
         to_gif(pr, "results/steps/pr")
             # save_image(image, f"results/steps/pr/{t}.png")
         
-    def forward(self, X, H, t, mask, **kwargs):
+    def forward(self, X, E, H, t, mask, **kwargs):
         # X = quantizer.dequantize(X)
         """
         X - [bs, n_nodes, 3]
         H - [bs, n_hyper, n_nodes]
         mask - [bs, n_nodes]
         """
-        X, H = self.model(X, H, t, mask, **kwargs)
+        X, E, H = self.model(X, E, H, t, mask, **kwargs)
         X = X * mask[..., None]
         H = H * mask[:, None, :]
   
-        return X, H
+        return X, E, H
     
     def denoise(self, *args, deterministic=False, last_step=False, **kwargs):
-        X0, H0 = self.forward(*args, **kwargs)
-        Xt, Ht, t, _ = args
+        X0, E0, H0 = self.forward(*args, **kwargs)
+        Xt, Et, Ht, t, *_ = args
         assert Xt.size() == X0.size()
         
-        return self.transition.denoise((X0, Xt), (H0, Ht), t, deterministic, last_step)
+        return self.transition.denoise((X0, Xt), (E0, Et), (H0, Ht), t, deterministic, last_step)
     
-    def transit(self, X, H, t):
-        return self.transition.transit(X, H, t)
+    def transit(self, X, E, H, t):
+        return self.transition.transit(X, E, H, t)
     
     @torch.no_grad()
     def sample_batch(self, bs: int = 16, device = torch.device('cuda' if torch.cuda.is_available() else "cpu"), return_every_step: bool = False, fake_sample: Union[int, bool] = False):
@@ -302,9 +313,11 @@ class Diffusion(pl.LightningModule):
                 X = torch.randn(size=(bs, max_nodes, 3), device=device)
             if self.transition.edge_scheduler.name == "identity":
                 H = datalist['H'].to(device)
+                E = datalist['E'].to(device)
             else:
                 if isinstance(self.transition.edge_scheduler, DiscreteNoiseScheduler):
                     H = (torch.rand(bs, self.dist.max_faces, max_nodes, device=device) > 0.5).long()
+                    E = (torch.rand(bs, max_nodes, max_nodes, device=device) > 0.5).long()
                 else:
                     H = torch.randn(size=(bs, self.dist.max_faces, max_nodes), device=device)
 
@@ -312,13 +325,14 @@ class Diffusion(pl.LightningModule):
         # reverse process
         for t in reversed(range(2, sample_start+1)):
             t = torch.ones(bs, dtype=torch.long, device=device) * t
-            X, H = self.denoise(X, H, t, mask, deterministic=False, **forward_kwargs)
+            
+            X, E, H = self.denoise(X, E, H, t, mask, deterministic=False, **forward_kwargs)
 
             if return_every_step:
                 pr.insert(0, (X, H))
 
         t = torch.ones_like(t)
-        X, H = self.denoise(X, H, t, mask, deterministic=True, last_step=True, **forward_kwargs)
+        X, E, H = self.denoise(X, E, H, t, mask, deterministic=True, last_step=True, **forward_kwargs)
 
         if return_every_step:
             pr.insert(0, (X, H))
@@ -327,18 +341,13 @@ class Diffusion(pl.LightningModule):
             assert len(gt) == len(pr) + 1
             return gt, pr
         else:
-            return X, H, mask
+            return X, E, H, mask
     
-    def render_samples(self, X, H, mask):
-        # shutil.rmtree(dir_path)
-        # os.makedirs(dir_path, exist_ok=True)
-        
-        # write obj
-        # obj_paths = []
+    def render_samples(self, X, E, H, mask):
         images = []
-        for i, (x, h, m) in enumerate(zip(list(X), list(H), list(mask))):
+        for i, (x, e, h, m) in enumerate(zip(list(X), list(E), list(H), list(mask))):
             try:
-                image = self.visualizer.visualize_object(x, h, m, i)
+                image = self.visualizer.visualize_object(x, e, h, m, i)
             except VerticesMutedError:
                 image = torch.zeros(4, 256, 256, dtype=torch.uint8)
             images.append(image)

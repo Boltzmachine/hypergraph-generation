@@ -16,3 +16,7 @@ class BCEWithLogitLoss(Criterion, nn.BCEWithLogitsLoss):
 @Criterion.register("mse")
 class MSELoss(Criterion, nn.MSELoss):
     ...
+
+@Criterion.register("ce")
+class CrossEntropyLoss(Criterion, nn.CrossEntropyLoss):
+    ...

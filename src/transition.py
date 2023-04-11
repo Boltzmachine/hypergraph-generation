@@ -21,11 +21,12 @@ class Transition(Model):
         self.node_scheduler = node_scheduler.construct(T=T)
         self.edge_scheduler = edge_scheduler.construct(T=T)
         
-    def transit(self, X, H, t):
+    def transit(self, X, E, H, t):
         X = self.transit_X(X, t)
+        E = self.transit_E(E, t)
         H = self.transit_H(H, t)
         
-        return X, H
+        return X, E, H
     
     def transit_X(self, X, t):
         if self.node_scheduler.name == "identity":
@@ -55,6 +56,22 @@ class Transition(Model):
         X = X_prob.multinomial(1).view(*X.size())
         
         return X
+    
+    def transit_E(self, E, t):
+        if self.edge_scheduler.name == "identity":
+            return (E, torch.zeros_like(E))
+        E0 = E
+        Qt_bar = self.edge_scheduler.get_Qt_bar(t)
+        E_mn = F.one_hot(E, self.edge_scheduler.n_classes).float()
+    
+        E_prob = E_mn @ Qt_bar.unsqueeze(1)
+
+        E_prob = E_prob.view(-1, E_prob.size(-1))
+        E = E_prob.multinomial(1).view(*E.size())
+        E = torch.triu(E, diagonal=1)
+        E = E + E.transpose(-1, -2)
+        
+        return E, E0
     
     def transit_H(self, H, t):
         if self.edge_scheduler.name == "identity":
@@ -88,16 +105,18 @@ class Transition(Model):
         
         return H, H0
     
-    def denoise(self, X: tuple, H: tuple, t, deterministic, last_step):
+    def denoise(self, X: tuple, E: tuple, H: tuple, t, deterministic, last_step):
         if self.node_scheduler.name == "identity":
             X = X[1]
         else:
             X = self.denoise_X(X, t, deterministic, last_step)
         if self.edge_scheduler.name == "identity":
             H = H[1]
+            E = E[1]
         else:
             H = self.denoise_H(H, t, deterministic, last_step)
-        return X, H
+            E = self.denoise_E(E, t, deterministic, last_step)
+        return X, E, H
 
     def denoise_X(self, X, t, deterministic, last_step):
         if isinstance(self.node_scheduler, DiscreteNoiseScheduler):
@@ -214,5 +233,64 @@ class Transition(Model):
         H = H.view(bs, n1, n2)
                     
         return H
+    
+    def denoise_E(self, E, t, deterministic, last_step):
+        if isinstance(self.edge_scheduler, DiscreteNoiseScheduler):
+            return self.denoise_E_discrete(E, t, deterministic, last_step)
+        elif isinstance(self.edge_scheduler, ContinuousNoiseScheduler):
+            return self.denoise_E_continuous(E, t, deterministic, last_step)
+        raise ValueError
+
+    def denoise_E_discrete(self, E, t, deterministic, last_step):
+        E_noise, Et = E
+        bs, n1, n2 = Et.size()
+        assert n1 == n2
+        
+        E0 = torch.softmax(E_noise, dim=-1)
+        Et = torch.stack([1-Et, Et], dim=-1).float()
+        
+        E0 = E0.view(bs, n1*n2, 2)
+        Et = Et.view(bs, n1*n2, 2)
+        if not last_step:
+            # xt @ Qt.T * x0 @ Qsb / x0 @ Qtb @ xt.T
+            Qt = self.edge_scheduler.get_Qt(t)
+            Qt_bar = self.edge_scheduler.get_Qt_bar(t)
+            # s=t-1
+            Qs_bar = self.edge_scheduler.get_Qt_bar(t-1)
+            
+            Qt_T = Qt.transpose(-1, -2)                 # bs, dt, d_t-1
+            left_term = Et @ Qt_T                      # bs, N, d_t-1
+            left_term = left_term.unsqueeze(dim=2)      # bs, N, 1, d_t-1
+
+            right_term = Qs_bar.unsqueeze(1)               # bs, 1, d0, d_t-1
+            numerator = left_term * right_term          # bs, N, d0, d_t-1
+
+            Et_T = Et.transpose(-1, -2)      # bs, dt, N
+
+            prod = Qt_bar @ Et_T                 # bs, d0, N
+            prod = prod.transpose(-1, -2)               # bs, N, d0
+            denominator = prod.unsqueeze(-1)            # bs, N, d0, 1
+            
+            denominator[denominator == 0] = 1e-6
+            q_s_given_t_and_0 = numerator / denominator # bs, N, d, d
+            
+            weighted = E0.unsqueeze(-1) * q_s_given_t_and_0         # bs, n, d0, d_t-1
+            unnormalized_prob_E = weighted.sum(dim=2)                     # bs, n, d_t-1
+            unnormalized_prob_E[torch.sum(unnormalized_prob_E, dim=-1) == 0] = 1e-5
+            E_prob = unnormalized_prob_E / torch.sum(unnormalized_prob_E, dim=-1, keepdim=True)  # bs, n, d_t-1
+        else:
+            E_prob = E0
+        
+        if deterministic:
+            E = E_prob.argmax(-1)
+        else:
+            E_prob = E_prob.view(-1, E_prob.size(-1))
+            E = E_prob.multinomial(1)
+        
+        E = E.view(bs, n1, n2)
+        E = torch.triu(E,  diagonal=1)
+        E = E + E.transpose(-1, -2)
+                    
+        return E
 
 Transition.register("default")(Transition)

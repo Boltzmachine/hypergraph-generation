@@ -38,7 +38,7 @@ class Train(Step):
         )
         logger.watch(model)
         
-        checkpoint_callback = ModelCheckpoint(dirpath="results/ckpts/", save_top_k=2, monitor="val/edge_acc", mode='max')
+        checkpoint_callback = ModelCheckpoint(dirpath="results/ckpts/", save_top_k=2, monitor="val/edge_acc", mode='max', save_last=True)
         
         trainer = trainer.construct(
             logger=logger, 

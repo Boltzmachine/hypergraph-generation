@@ -20,7 +20,7 @@ import math
 class SinusoidalPositionalEncoding(Model):
     def __init__(self, d_model: int, max_len: int):
         super().__init__()
-
+        self.d_model = d_model
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
         pe = torch.zeros(max_len, d_model)
@@ -515,13 +515,13 @@ class Transformer(Model):
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        
+
+        hidden_dim = hidden_dim + self.position_encoder.d_model
         self.type_embedder = nn.Embedding(2, hidden_dim)
         
         n_head = 8
         self.relation_embedder = nn.Embedding(6, n_head)
-        
-        self.transformer = TransformerEncoder(n_layers=4, n_head=n_head, d_k=hidden_dim//n_head, d_v=hidden_dim//n_head, d_model=hidden_dim, d_inner=2 * hidden_dim)
+        self.transformer = TransformerEncoder(n_layers=3, n_head=n_head, d_k=hidden_dim//n_head, d_v=hidden_dim//n_head, d_model=hidden_dim, d_inner=2 * hidden_dim)
         
         self.node_head = nn.Sequential(
             nn.Linear(1 * hidden_dim, 2 * hidden_dim),
@@ -534,7 +534,7 @@ class Transformer(Model):
             nn.Linear(hidden_dim, 1)
         )
         
-    def forward(self, X, H, t, mask):
+    def forward(self, X, E, H, t, mask):
         """
         X - [bs, n_nodes, 3]
         H - [bs, n_hyper, n_nodes]
@@ -550,11 +550,11 @@ class Transformer(Model):
 
         pos_emb = self.position_encoder(t)
         # [bs, n_nodes, hidden_dim]
-        vertex_emb = (X + pos_emb[:, None, :])# * mask[..., None]
+        vertex_emb = torch.cat([X, pos_emb[:, None, :].expand(-1, n_nodes, -1)], dim=-1)
 
         face_emb = self.face_embedder((H * mask[:, None, :]).sum(-1, keepdim=True).to(vertex_emb.dtype))
-        face_emb = face_emb + pos_emb[:, None, :]
-        
+        face_emb = torch.cat([face_emb, pos_emb[:, None, :].expand(-1, n_hyper, -1)], dim=-1)
+
         input_emb = torch.cat([vertex_emb, face_emb], dim=1)
         type_ids = torch.cat([torch.zeros(n_nodes, device=X.device), torch.ones(n_hyper, device=H.device)]).long()
         type_emb = self.type_embedder(type_ids)
@@ -572,24 +572,6 @@ class Transformer(Model):
             torch.cat([ btn_left, btn_right ], dim=2),
         ], dim=1)
 
-        # relation = torch.tensor([
-        #     [5, 5, 5, 5, 5, 5, 5, 5, 3, 4, 3, 4, 3, 4],
-        #     [5, 5, 5, 5, 5, 5, 5, 5, 3, 4, 3, 4, 4, 3],
-        #     [5, 5, 5, 5, 5, 5, 5, 5, 3, 4, 4, 3, 3, 4],
-        #     [5, 5, 5, 5, 5, 5, 5, 5, 3, 4, 4, 3, 4, 3],
-        #     [5, 5, 5, 5, 5, 5, 5, 5, 4, 3, 3, 4, 3, 4],
-        #     [5, 5, 5, 5, 5, 5, 5, 5, 4, 3, 3, 4, 4, 3],
-        #     [5, 5, 5, 5, 5, 5, 5, 5, 4, 3, 4, 3, 3, 4],
-        #     [5, 5, 5, 5, 5, 5, 5, 5, 3, 4, 3, 3, 4, 3],
-            
-        #     [1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2],
-        #     [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2],
-        #     [1, 1, 0, 0, 1, 1, 0, 0, 2, 2, 2, 2, 2, 2],
-        #     [0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2],
-        #     [1, 0, 1, 0, 1, 0, 1, 0, 2, 2, 2, 2, 2, 2],
-        #     [0, 1, 0, 1, 0, 1, 0, 1, 2, 2, 2, 2, 2, 2],
-        # ], device=X.device, dtype=torch.long)[None, ...].expand(bs, -1, -1)
-
         relation = self.relation_embedder(relation).permute(0, 3, 1, 2).contiguous()
         attn_mask = attn_mask[..., None] * attn_mask[:, None, :]
 
@@ -606,4 +588,102 @@ class Transformer(Model):
 
         X = self.node_head(vertex_emb).view(bs, n_nodes, 3)        
         H = self.edge_head(edge_emb).view(bs, n_hyper, n_nodes)
-        return X, H
+        return X, F.one_hot(E, num_classes=2).float() * 2e8 - 1e8, H
+    
+from ..digress.models.transformer_model import GraphTransformer
+
+@Model.register("graph_tf")
+class GraphTransformerW(Model):
+    def __init__(self, position_encoder: Model):
+        super().__init__()
+        self.position_encoder = position_encoder
+        y_dim = position_encoder.d_model
+        self.model = GraphTransformer(
+            n_layers=5,
+            input_dims={"X": 3, "E": 2, "y": y_dim},
+            hidden_mlp_dims={'X': 256, 'E': 128, 'y': 128},
+            hidden_dims={'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 128},
+            output_dims={"X": 3, "E": 2, "y": 0},
+        )
+    
+    def forward(self, X, E, H, t, mask):
+        y = self.position_encoder(t)
+        E = F.one_hot(E, num_classes=2).float()
+
+        outputs = self.model(X, E, y, mask)
+        
+        return outputs.X, outputs.E, H
+    
+
+@Model.register("gb_tf")
+class GlobalTransformer(Model):
+    def __init__(
+        self,
+        position_encoder: Model,
+        hidden_dim: int = 256,
+        ) -> None:
+        super().__init__()
+        
+        self.position_encoder = position_encoder
+        
+        self.node_embedder = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.face_embedder = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        n_head = 8
+        self.relation_embedder = nn.Embedding(6, n_head)
+        self.transformer = TransformerEncoder(n_layers=4, n_head=n_head, d_k=hidden_dim//n_head, d_v=hidden_dim//n_head, d_model=hidden_dim, d_inner=2 * hidden_dim)
+        
+        self.node_head = nn.Sequential(
+            nn.Linear(1 * hidden_dim, 2 * hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(2 * hidden_dim, 3)
+        )
+        self.edge_head = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, 2)
+        )
+        
+    def forward(self, X, E, H, t, mask):
+        """
+        X - [bs, n_nodes, 3]
+        H - [bs, n_hyper, n_nodes]
+        mask - [bs, n_nodes]
+        """
+        bs, n_nodes, _ = X.size()
+
+        X = self.node_embedder(X)
+
+        pos_emb = self.position_encoder(t)
+        # [bs, n_nodes, hidden_dim]
+        input_emb = (X + pos_emb[:, None, :])
+
+
+        attn_mask = mask
+        relation= E
+
+        relation = self.relation_embedder(relation).permute(0, 3, 1, 2).contiguous()
+        attn_mask = attn_mask[..., None] * attn_mask[:, None, :]
+
+        vertex_emb = self.transformer(input_emb, None, relation)
+
+        # [bs, n_hyper, n_nodes, 2 * hidden_dim]
+        edge_emb = torch.cat([
+            vertex_emb[:, :, None, :].expand(-1, -1, n_nodes, -1),
+            vertex_emb[:, None, :, :].expand(-1, n_nodes, -1, -1)
+            ], dim=-1)
+
+        X = self.node_head(vertex_emb).view(bs, n_nodes, 3)        
+        E = self.edge_head(edge_emb).view(bs, n_nodes, n_nodes, 2)
+
+        E = 1/2 * (E + torch.transpose(E, 1, 2))
+
+        return X, E, H

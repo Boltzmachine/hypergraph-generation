@@ -87,7 +87,7 @@ class BlenderRenderer(Visualizer):
         bpy.ops.mesh.edge_face_add()
 
     @stdout_suppress()
-    def visualize_object(self, x, h, m, idx=None):
+    def visualize_object(self, x, e, h, m, idx=None):
         in_mem_dir = "/dev/shm" # store file in memory so it would be faster and still compatible to API
         temp_dir = "hypergen_render"
         dir_path = os.path.join(in_mem_dir, temp_dir)
@@ -155,18 +155,21 @@ class MatplotlibPlotter(Visualizer):
     def __init__(self) -> None:
         super().__init__()
         
-    def visualize_object(self, x, h, idx=None):
+    def visualize_object(self, x, e, h, m, idx=None):
         """
         x - [n_nodes, 3]
         h - [n_hyper, n_nodes]
         """
         device = x.device
         x = x.cpu().numpy()
-        h = torch.unique(h, dim=0, sorted=False).bool().cpu().numpy()
+        # h = torch.unique(h, dim=0, sorted=False).bool().cpu().numpy()
         collection = []
-        for face in h:
-            collection.append(x[face])
-        
+        # for face in h:
+        #     collection.append(x[face])
+
+        e = torch.triu(e, diagonal=1)
+        e = e.nonzero().cpu().numpy()
+
         fig = plt.figure(figsize=(3, 3), dpi=96)
         canvas = FigureCanvas(fig)
         ax = fig.add_subplot(111, projection='3d')
@@ -184,6 +187,11 @@ class MatplotlibPlotter(Visualizer):
             s=10,
             c=['b', 'g', 'r', 'c', 'm', 'y', 'k', 'darkorange'],
             alpha=0.75)
+        
+        coords = x[e]
+
+        for coord in coords:
+            ax.plot(coord[:, 0], coord[:, 1], coord[:, 2])
         
         ax_lims = 0.5
         ax.set_xlim(-ax_lims, ax_lims)

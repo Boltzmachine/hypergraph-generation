@@ -14,11 +14,10 @@ local batch_size = 512;
       model: {
         type: 'diffusion',
         model: {
-          type: "transformer",
-          hidden_dim: hidden_dim,
+          type: "gb_tf",
           position_encoder: {
             type: "sin",
-            d_model: 64,
+            d_model: hidden_dim,
             max_len: T
           },
         },
@@ -26,8 +25,8 @@ local batch_size = 512;
           type: "mse",
           reduction: "none"
         },
-        face_criterion: {
-          type: "bce",
+        edge_criterion: {
+          type: "ce",
           reduction: "none"
         },
         learning_rate: 1e-3,
@@ -45,15 +44,15 @@ local batch_size = 512;
           }
         },
         visualizer: {
-          type: "blender"
+          type: "matplotlib"
         },
-        sample_bs: 64
+        sample_bs: 64,
       },
       data_module: {
         type: "cuboid",
         batch_size: batch_size,
       },
-      run_name: "cuboid"
+      run_name: "cuboid-edge"
     },
   },
 }

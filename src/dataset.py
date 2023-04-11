@@ -9,6 +9,7 @@ from tqdm import tqdm
 import random
 
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data, HeteroData
 from torch.utils.data import random_split, default_collate
 from tango.common.registrable import Registrable
@@ -97,6 +98,16 @@ class CuboidDataset(Dataset):
             [1, 0, 1, 0, 1, 0, 1, 0],
             [0, 1, 0, 1, 0, 1, 0, 1],
         ], dtype=torch.long)
+    static_edge = torch.tensor([
+        [0, 1, 1, 0, 1, 0, 0, 0],
+        [1, 0, 0, 1, 0, 1, 0, 0],
+        [1, 0, 0, 1, 0, 0, 1, 0],
+        [0, 1, 1, 0, 0, 0, 0, 1],
+        [1, 0, 0, 0, 0, 1, 1, 0],
+        [0, 1, 0, 0, 1, 0, 0, 1],
+        [0, 0, 1, 0, 1, 0, 0, 1],
+        [0, 0, 0, 1, 0, 1, 1, 0],
+    ])
     
     def __init__(self, length: int):
         super().__init__()
@@ -108,10 +119,10 @@ class CuboidDataset(Dataset):
 
     def __getitem__(self, idx):
         verts = CuboidDataset.gen_verts()
-
         return {
             "X": verts,
             "H": self.static_hyperedge,
+            "E": self.static_edge,
             "mask": torch.ones(8, dtype=torch.long),
         }
         
@@ -167,24 +178,24 @@ class PrismDataset(Dataset):
         }
         
 
-def get_mask_collate_fn_by_max_face(max_face = None):
+# def get_mask_collate_fn_by_max_face(max_face = None):
     
-    def mask_collate_fn(batchs):
-        max_num_nodes = max([batch['X'].size(0) for batch in batchs])
-        for batch in batchs:
-            X = batch['X']
-            pad_len = max_num_nodes - X.size(0)
-            mask = torch.zeros(max_num_nodes, dtype=torch.long)
-            mask[:X.size(0)] = 1
-            batch['mask'] = mask
-            batch['X'] = torch.cat([X, torch.zeros(pad_len, X.size(1), dtype=X.dtype)], dim=0)
-            H = batch['H']
-            H = torch.cat([H, torch.zeros(H.size(0), pad_len, dtype=H.dtype)], dim=1)
-            batch['H'] = torch.cat([H, torch.zeros(max_face - H.size(0), H.size(1), dtype=H.dtype)], dim=0)
+#     def mask_collate_fn(batchs):
+#         max_num_nodes = max([batch['X'].size(0) for batch in batchs])
+#         for batch in batchs:
+#             X = batch['X']
+#             pad_len = max_num_nodes - X.size(0)
+#             mask = torch.zeros(max_num_nodes, dtype=torch.long)
+#             mask[:X.size(0)] = 1
+#             batch['mask'] = mask
+#             batch['X'] = torch.cat([X, torch.zeros(pad_len, X.size(1), dtype=X.dtype)], dim=0)
+#             H = batch['H']
+#             H = torch.cat([H, torch.zeros(H.size(0), pad_len, dtype=H.dtype)], dim=1)
+#             batch['H'] = torch.cat([H, torch.zeros(max_face - H.size(0), H.size(1), dtype=H.dtype)], dim=0)
 
-        return default_collate(batchs)
+#         return default_collate(batchs)
     
-    return mask_collate_fn
+#     return mask_collate_fn
     
     
 class DataModule(pl.LightningDataModule, Registrable):
@@ -202,6 +213,8 @@ class CuboidDataModule(DataModule):
         
         self.train_len = 10000
         self.val_len = 100
+
+        self.collate_fn = default_collate
 
     def setup(self, stage: str):
         self.train = CuboidDataset(self.train_len)

@@ -102,13 +102,25 @@ def masked_select_H(H, mask):
     elif H.dim() == 4:
         raise NotImplementedError
         return torch.masked_select(H.transpose(1, 2), mask[..., None, None]).view(-1, H.size(1)).transpose(1, -1)
+    
+def masked_select_E(E, mask):
+    """
+    E - [bs, n_nodes, n_nodes, ?]
+    """
+    mask = mask.bool()
+    mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+    if E.dim() == 3:
+        return torch.masked_select(E, mask).view(-1)
+    elif E.dim() == 4:
+        return torch.masked_select(E, mask[..., None]).view(-1, E.size(-1))
 
 
-def prepare_for_loss_and_metrics(X, batch_X, H, batch_H, mask):
+def prepare_for_loss_and_metrics(X, batch_X, E, batch_E, H, batch_H, mask):
     """
     mask out X and H, flatten all of them
     X: [bs, n_nodes, 3, 256]
     batch_X: [bs, n_nodes, 3]
+    E: [bs, n_nodes, n_nodes, 2]
     H: [bs, n_hyper, n_nodes]
     batch_H: [bs, n_hyper_n_nodes]
     mask: [bs, n_nodes]
@@ -117,8 +129,10 @@ def prepare_for_loss_and_metrics(X, batch_X, H, batch_H, mask):
     batch_X = masked_select_X(batch_X, mask)
     H = masked_select_H(H, mask)
     batch_H = masked_select_H(batch_H, mask)
+    E = masked_select_E(E, mask)
+    batch_E = masked_select_E(batch_E, mask)
     assert X.size(-1) == batch_X.size(-1) == 3
-    return X, batch_X, H, batch_H
+    return X, batch_X, E, batch_E, H, batch_H
 
 def create_mask_from_length(length: torch.Tensor):
     mask = torch.arange(length.max(), device=length.device)[None, :] < length[:, None]
