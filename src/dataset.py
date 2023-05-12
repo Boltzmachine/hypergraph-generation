@@ -84,7 +84,8 @@ class ShapenetDataset(Dataset):
 
         return {
             "X": verts,
-            "H": faces
+            "H": faces,
+            "E": torch.ones(verts.size(0), verts.size(0), dtype=torch.long),
         }
 
 
@@ -119,9 +120,17 @@ class CuboidDataset(Dataset):
 
     def __getitem__(self, idx):
         verts = CuboidDataset.gen_verts()
+        face = self.static_hyperedge
+        
+        shuffle = True
+        if shuffle:
+            idx = torch.randperm(8)
+            verts = verts[idx]
+            face = face[:, idx]
+        
         return {
             "X": verts,
-            "H": self.static_hyperedge,
+            "H": face,
             "E": self.static_edge,
             "mask": torch.ones(8, dtype=torch.long),
         }
@@ -149,7 +158,7 @@ class PrismDataset(Dataset):
         return self.length
     
     def __getitem__(self, idx):
-        n = random.randint(3, 4)
+        n = random.randint(3, 8)
 
         theta = torch.linspace(0, 2 * torch.pi, n+1)[:-1]
 
@@ -171,31 +180,39 @@ class PrismDataset(Dataset):
         idx2 = idx2.view(-1)
         idx1 = torch.arange(n).repeat_interleave(4)
         face[idx1+2, idx2] = 1
+        
+        shuffle = True
+        if shuffle:
+            idx = torch.randperm(verts.size(0))
+            verts = verts[idx]
+            face = face[:, idx]
 
         return {
             "X": verts,
             "H": face,
+            "E": torch.ones(2 * n, 2 * n, dtype=torch.long),
         }
         
 
-# def get_mask_collate_fn_by_max_face(max_face = None):
+def get_mask_collate_fn_by_max_face(max_face = None):
     
-#     def mask_collate_fn(batchs):
-#         max_num_nodes = max([batch['X'].size(0) for batch in batchs])
-#         for batch in batchs:
-#             X = batch['X']
-#             pad_len = max_num_nodes - X.size(0)
-#             mask = torch.zeros(max_num_nodes, dtype=torch.long)
-#             mask[:X.size(0)] = 1
-#             batch['mask'] = mask
-#             batch['X'] = torch.cat([X, torch.zeros(pad_len, X.size(1), dtype=X.dtype)], dim=0)
-#             H = batch['H']
-#             H = torch.cat([H, torch.zeros(H.size(0), pad_len, dtype=H.dtype)], dim=1)
-#             batch['H'] = torch.cat([H, torch.zeros(max_face - H.size(0), H.size(1), dtype=H.dtype)], dim=0)
+    def mask_collate_fn(batchs):
+        max_num_nodes = max([batch['X'].size(0) for batch in batchs])
+        for batch in batchs:
+            X = batch['X']
+            pad_len = max_num_nodes - X.size(0)
+            mask = torch.zeros(max_num_nodes, dtype=torch.long)
+            mask[:X.size(0)] = 1
+            batch['mask'] = mask
+            batch['X'] = torch.cat([X, torch.zeros(pad_len, X.size(1), dtype=X.dtype)], dim=0)
+            H = batch['H']
+            H = torch.cat([H, torch.zeros(H.size(0), pad_len, dtype=H.dtype)], dim=1)
+            batch['H'] = torch.cat([H, torch.zeros(max_face - H.size(0), H.size(1), dtype=H.dtype)], dim=0)
+            batch['E'] = torch.zeros(max_num_nodes, max_num_nodes, dtype=torch.long)
 
-#         return default_collate(batchs)
+        return default_collate(batchs)
     
-#     return mask_collate_fn
+    return mask_collate_fn
     
     
 class DataModule(pl.LightningDataModule, Registrable):

@@ -157,8 +157,8 @@ class EdgeGNNConv(Model):
         self.hidden_dim = hidden_dim
         aggr = ['mean', 'sum', 'std', 'max', 'min']
         # aggr = 'mean'
-        # self.conv = pyg_nn.GENConv(hidden_dim, hidden_dim)#, aggr=aggr)
-        self.conv = pyg_nn.TransformerConv(hidden_dim, hidden_dim//8, heads=8, edge_dim=2)
+        self.conv = pyg_nn.SAGEConv(hidden_dim, hidden_dim, aggr=aggr)
+        # self.conv = pyg_nn.TransformerConv(hidden_dim, hidden_dim//8, heads=8, edge_dim=2)
         # self.conv = MeshConv(hidden_dim, hidden_dim, aggr=aggr)
 
         self.norm1 = pyg_nn.norm.LayerNorm(hidden_dim)
@@ -282,8 +282,10 @@ class HyperModel(Model):
         edge_types = [("vertex", "in", "face"), ("face", "has", "vertex")]
         meta_data = (node_types, edge_types)
         
-        backbone_class = EdgeGNNConv
-
+        self.pos_embedder = nn.Embedding(1000, hidden_dim)
+        
+        backbone_class = MultiChannelGNNConv
+        
         self.convs = nn.ModuleList([
             nn.ModuleList([
                 backbone_class(hidden_dim),
@@ -313,7 +315,7 @@ class HyperModel(Model):
             nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, X, H, t, mask):
+    def forward(self, X, E, H, t, mask):
         """
         X - [bs, n_nodes, 3]
         H - [bs, n_hyper, n_nodes]
@@ -331,9 +333,11 @@ class HyperModel(Model):
         pos_emb = self.position_encoder(t)
         # [bs, n_nodes, hidden_dim]
         vertex_emb = (X + pos_emb[:, None, :])# * mask[..., None]
+        vertex_emb = vertex_emb + self.pos_embedder(100+torch.arange(vertex_emb.size(1), device=vertex_emb.device))
 
         face_emb = self.face_embedder((H * mask[:, None, :]).sum(-1, keepdim=True).to(vertex_emb.dtype))
         face_emb = face_emb + pos_emb[:, None, :]
+        face_emb = face_emb + self.pos_embedder(torch.arange(face_emb.size(1), device=face_emb.device)) 
         
         for conv in self.convs:
             # [bs, n_hyper, hidden_dim]
@@ -356,7 +360,7 @@ class HyperModel(Model):
         # edge_emb = torch.cat([edge_emb, H[..., None].expand(-1, -1, -1, self.hidden_dim).to(edge_emb.dtype)], dim=-1)
         H = self.edge_head(edge_emb).view(bs, n_hyper, n_nodes)
     
-        return X, H
+        return X, F.one_hot(E, num_classes=2).float() * 2e8 - 1e8, H
 
 
 
@@ -500,12 +504,16 @@ class Transformer(Model):
         self,
         hidden_dim: int,
         position_encoder: Model,
+        n_layer: int = 3
         ) -> None:
         super().__init__()
         
         self.position_encoder = position_encoder
         
+        # self.rank_embedder = nn.ModuleList([nn.Embedding(1000, hidden_dim) for _ in range(3)])
+        self.L = 10
         self.node_embedder = nn.Sequential(
+            # nn.Linear(3 * self.L * 2, hidden_dim),
             nn.Linear(3, hidden_dim),
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, hidden_dim)
@@ -518,10 +526,12 @@ class Transformer(Model):
 
         hidden_dim = hidden_dim + self.position_encoder.d_model
         self.type_embedder = nn.Embedding(2, hidden_dim)
+        self.face_pos_embedder = nn.Embedding(100, hidden_dim)
+        self.vertex_pos_embedder = nn.Embedding(100, hidden_dim)
         
         n_head = 8
         self.relation_embedder = nn.Embedding(6, n_head)
-        self.transformer = TransformerEncoder(n_layers=3, n_head=n_head, d_k=hidden_dim//n_head, d_v=hidden_dim//n_head, d_model=hidden_dim, d_inner=2 * hidden_dim)
+        self.transformer = TransformerEncoder(n_layers=n_layer, n_head=n_head, d_k=hidden_dim//n_head, d_v=hidden_dim//n_head, d_model=hidden_dim, d_inner=2 * hidden_dim)
         
         self.node_head = nn.Sequential(
             nn.Linear(1 * hidden_dim, 2 * hidden_dim),
@@ -545,17 +555,41 @@ class Transformer(Model):
         # [bs, n_nodes, 3]
         # X = quantizer.dequantize(X)
         # [bs, n_nodes, hidden_dim]
-        
-        X = self.node_embedder(X)
-
         pos_emb = self.position_encoder(t)
+        
+        # rank = torch.sort(X, 1)[1]
+        # rank_emb = torch.stack([
+        #     self.rank_embedder[i](rank[..., i]) for i in range(3)
+        # ], dim=-1).sum(-1)
+        
+        # arange = torch.arange(self.L, device=X.device)
+        # # pe - [bs, n_nodes, 3, 2 * L]
+        # pe_sin = torch.sin(2**arange * torch.pi * X.unsqueeze(-1))
+        # pe_cos = torch.cos(2**arange * torch.pi * X.unsqueeze(-1))
+        # pe = torch.stack([pe_sin, pe_cos], dim=-1).view(bs, n_nodes, 3, -1).view(bs, n_nodes, -1)  
+
+        vertex_emb = X
+        vertex_emb = self.node_embedder(vertex_emb)# + rank_emb
+
         # [bs, n_nodes, hidden_dim]
-        vertex_emb = torch.cat([X, pos_emb[:, None, :].expand(-1, n_nodes, -1)], dim=-1)
+        vertex_emb = torch.cat([vertex_emb, pos_emb[:, None, :].expand(-1, n_nodes, -1)], dim=-1) + self.vertex_pos_embedder(torch.arange(vertex_emb.size(1), device=vertex_emb.device))
+
+        # H = H * mask[:, None, :]
+        # face_feats = (X.unsqueeze(1) * H.unsqueeze(-1))
+        # face_feats_max = face_feats.masked_fill(~H.unsqueeze(-1).bool(), -10).max(-2)[0]
+        # face_feats_min = face_feats.masked_fill(~H.unsqueeze(-1).bool(), 10).min(-2)[0]
+        # face_feats = face_feats.masked_fill(~H.unsqueeze(-1).bool(), torch.nan)
+        # face_feats_sum = torch.nan_to_num(face_feats.nansum(-2))
+        # face_feats_mean = torch.nan_to_num(face_feats.nanmean(-2))
+        # face_emb = torch.cat([face_feats_max, face_feats_min, face_feats_sum, face_feats_mean], dim=-1)
 
         face_emb = self.face_embedder((H * mask[:, None, :]).sum(-1, keepdim=True).to(vertex_emb.dtype))
+        # face_emb = self.face_embedder(face_emb)
         face_emb = torch.cat([face_emb, pos_emb[:, None, :].expand(-1, n_hyper, -1)], dim=-1)
-
+        
+        face_emb = face_emb + self.face_pos_embedder(torch.arange(face_emb.size(1), device=face_emb.device)) 
         input_emb = torch.cat([vertex_emb, face_emb], dim=1)
+
         type_ids = torch.cat([torch.zeros(n_nodes, device=X.device), torch.ones(n_hyper, device=H.device)]).long()
         type_emb = self.type_embedder(type_ids)
         
@@ -575,7 +609,7 @@ class Transformer(Model):
         relation = self.relation_embedder(relation).permute(0, 3, 1, 2).contiguous()
         attn_mask = attn_mask[..., None] * attn_mask[:, None, :]
 
-        output = self.transformer(input_emb, None, relation)
+        output = self.transformer(input_emb, attn_mask, relation)
         
         vertex_emb = output[:, :n_nodes, :]
         face_emb = output[:, n_nodes:, :]

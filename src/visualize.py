@@ -187,11 +187,11 @@ class MatplotlibPlotter(Visualizer):
             s=10,
             c=['b', 'g', 'r', 'c', 'm', 'y', 'k', 'darkorange'],
             alpha=0.75)
-        
+
         coords = x[e]
 
-        for coord in coords:
-            ax.plot(coord[:, 0], coord[:, 1], coord[:, 2])
+        # for coord in coords:
+        #     ax.plot(coord[:, 0], coord[:, 1], coord[:, 2])
         
         ax_lims = 0.5
         ax.set_xlim(-ax_lims, ax_lims)

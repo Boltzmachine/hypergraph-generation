@@ -117,7 +117,7 @@ class Diffusion(pl.LightningModule):
         assert not (self.do_face and self.do_edge)
         
         self.edge_acc = torchmetrics.Accuracy(task="binary") if self.do_face else torchmetrics.Accuracy(task="multiclass", num_classes=transition.edge_scheduler.n_classes)
-        self.node_mae = torchmetrics.MeanAbsoluteError()
+        self.node_mse = torchmetrics.MeanSquaredError()
         
         # self.node_ema = StepEMA(transition.T, "node")
         # self.edge_ema = StepEMA(transition.T, "edge")
@@ -210,17 +210,17 @@ class Diffusion(pl.LightningModule):
         if self.do_edge:
             self.edge_acc(pred_E, true_E)
 
-        self.node_mae(pred_X, true_X)
+        self.node_mse(pred_X, true_X)
 
 
     def on_validation_epoch_end(self) -> None:
         # self.log("val/node_acc", self.node_acc)
-        self.log("val/node_mae", self.node_mae)
+        self.log("val/node_mse", self.node_mse)
         self.log("val/edge_acc", self.edge_acc)
         # self.node_ema.log()
         # self.edge_ema.log()
 
-        X, E, H, mask = self.sample_batch(bs=self.sample_bs)        
+        X, E, H, mask = self.sample_batch(bs=self.sample_bs, fake_sample=False)
         X = quantizer.quantize2(X)
         
         images = self.render_samples(X, E, H, mask)
@@ -280,25 +280,31 @@ class Diffusion(pl.LightningModule):
         n_nodes = self.dist.sample_n(bs, device)
         max_nodes = n_nodes.max()
         collate_fn = self.trainer.datamodule.collate_fn
+        
+        if isinstance(fake_sample, bool) and fake_sample:
+            fake_sample = self.transition.T
 
         sample_start = self.transition.T
         if return_every_step:
             pr = []
         if fake_sample:
             sample_start = fake_sample
+            if sample_start == -1:
+                sample_start = self.transition.T
             datalist = collate_fn([self.trainer.datamodule.val[i] for i in range(bs)])
             X = datalist['X'].to(device)
             mask = datalist['mask'].to(device)
             H = datalist['H'].to(device)
+            E = datalist['E'].to(device)
 
             if return_every_step:
                 gt = [(X, H)]
                 for t in range(1, sample_start+1):
-                    (Xt, _), (Ht, _) = self.transit(X, H, t * torch.ones(bs, dtype=torch.long, device=device))
+                    (Xt, _), (Et, _), (Ht, _) = self.transit(X, E, H, t * torch.ones(bs, dtype=torch.long, device=device))
                     gt.append((Xt, Ht))
                 X, H = gt[-1]
             else:
-                (X, _), (H, _) = self.transit(X, H, sample_start * torch.ones(bs, dtype=torch.long, device=device))
+                (X, _), (E, _), (H, _) = self.transit(X, E, H, sample_start * torch.ones(bs, dtype=torch.long, device=device))
 
         else:
             if self.transition.node_scheduler.name == "identity" or self.transition.edge_scheduler.name == "identity":
@@ -331,7 +337,7 @@ class Diffusion(pl.LightningModule):
             if return_every_step:
                 pr.insert(0, (X, H))
 
-        t = torch.ones_like(t)
+        t = torch.ones(bs, dtype=torch.long, device=device)
         X, E, H = self.denoise(X, E, H, t, mask, deterministic=True, last_step=True, **forward_kwargs)
 
         if return_every_step:

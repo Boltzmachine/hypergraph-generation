@@ -1,5 +1,5 @@
 local hidden_dim = 256;
-local T = 300;
+local T = 1000;
 local batch_size = 512;
 
 {
@@ -21,12 +21,13 @@ local batch_size = 512;
             d_model: hidden_dim,
             max_len: T
           },
+          // n_layer: 6,
         },
         node_criterion: {
           type: "mse",
           reduction: "none"
         },
-        edge_criterion: {
+        face_criterion: {
           type: "bce",
           reduction: "none"
         },
@@ -40,13 +41,14 @@ local batch_size = 512;
           },
           edge_scheduler: {
             type: "uniform_discrete",
-            beta_schedule: "linear_beta_schedule",
+            beta_schedule: "cosine_beta_schedule",
             n_classes: 2,
           }
         },
         visualizer: {
           type: "blender"
-        }
+        },
+        sample_bs: 16,
       },
       data_module: {
         type: "prism",
